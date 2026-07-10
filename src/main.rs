@@ -1,13 +1,24 @@
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use comfy_table::{Cell, Color, Table};
+use comfy_table::{Cell, Color, Table as PlainTable};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::execute;
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
 use mavlink::dialects::common;
 use mavlink::{MavHeader, MavlinkVersion, Message, MessageData};
+use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Cell as TuiCell, Paragraph, Row, Table, TableState};
 use serde_yaml::Value;
 use serialport::SerialPort;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{ErrorKind, Read};
+use std::io::{self, ErrorKind, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -31,9 +42,13 @@ struct Args {
     #[arg(long, default_value_t = 15)]
     param_timeout: u64,
 
-    /// Print every received watched parameter plus basic vehicle identity.
+    /// Print extra collection context before showing the audit.
     #[arg(long)]
     verbose: bool,
+
+    /// Print a static table instead of opening the interactive TUI.
+    #[arg(long)]
+    plain: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +63,15 @@ struct Recommendation {
     source: String,
 }
 
+#[derive(Debug, Clone)]
+struct AuditRow {
+    name: String,
+    current: String,
+    baseline: String,
+    source: String,
+    status: String,
+}
+
 #[derive(Debug)]
 struct VehicleIdentity {
     system_id: u8,
@@ -56,21 +80,6 @@ struct VehicleIdentity {
     autopilot: common::MavAutopilot,
     version: Option<common::AUTOPILOT_VERSION_DATA>,
 }
-
-const WATCHED_PARAMS: &[&str] = &[
-    "SYS_AUTOSTART",
-    "MAV_TYPE",
-    "GPS_1_CONFIG",
-    "GPS_2_CONFIG",
-    "SYS_HAS_GPS",
-    "EKF2_GPS_CTRL",
-    "EKF2_GPS_CHECK",
-    "EKF2_HGT_REF",
-    "EKF2_RNG_CTRL",
-    "SENS_EN_SF1XX",
-    "SF1XX_MODE",
-    "SF1XX_ROT",
-];
 
 const PROTECTED_PARAMS: &[&str] = &[
     "SENS_EN_SF1XX",
@@ -104,19 +113,26 @@ fn main() -> Result<()> {
 
     let device_sys_autostart = params.get("SYS_AUTOSTART").map(|p| p.value.round() as i32);
     let baseline_sys_autostart = args.sys_autostart.or(device_sys_autostart);
-    let firmware_defaults = load_firmware_defaults(&args.px4_source, WATCHED_PARAMS)?;
+    let wanted_params: HashSet<String> = params.keys().cloned().collect();
+    let firmware_defaults = load_firmware_defaults(&args.px4_source, &wanted_params)?;
     let airframe_defaults = if let Some(id) = baseline_sys_autostart {
-        load_airframe_defaults(&args.px4_source, id, WATCHED_PARAMS)?
+        load_airframe_defaults(&args.px4_source, id, &wanted_params)?
     } else {
         HashMap::new()
     };
 
     let recommendations = build_recommendations(firmware_defaults, airframe_defaults);
     print_baseline(device_sys_autostart, args.sys_autostart, &args.px4_source)?;
-    print_audit_table(&params, &recommendations);
+    let rows = build_audit_rows(&params, &recommendations);
 
     if args.verbose {
         println!("\nPX4 source: {}", args.px4_source.display());
+    }
+
+    if args.plain || !io::stdout().is_terminal() {
+        print_audit_table(&rows);
+    } else {
+        run_tui(rows)?;
     }
 
     Ok(())
@@ -449,14 +465,16 @@ fn format_hash(bytes: &[u8; 8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn load_firmware_defaults(px4_source: &Path, watched: &[&str]) -> Result<HashMap<String, String>> {
-    let watched: HashSet<&str> = watched.iter().copied().collect();
+fn load_firmware_defaults(
+    px4_source: &Path,
+    wanted: &HashSet<String>,
+) -> Result<HashMap<String, String>> {
     let mut defaults = HashMap::new();
     let src = px4_source.join("src");
     visit_yaml_files(&src, &mut |path| {
         if let Ok(text) = fs::read_to_string(path) {
             if let Ok(yaml) = serde_yaml::from_str::<Value>(&text) {
-                collect_yaml_defaults(&yaml, &watched, &mut defaults);
+                collect_yaml_defaults(&yaml, wanted, &mut defaults);
             }
         }
     })?;
@@ -484,7 +502,7 @@ fn visit_yaml_files(dir: &Path, f: &mut dyn FnMut(&Path)) -> Result<()> {
 
 fn collect_yaml_defaults(
     value: &Value,
-    watched: &HashSet<&str>,
+    wanted: &HashSet<String>,
     defaults: &mut HashMap<String, String>,
 ) {
     match value {
@@ -493,7 +511,7 @@ fn collect_yaml_defaults(
             {
                 for (key, body) in definitions {
                     if let Some(name) = key.as_str() {
-                        if watched.contains(name) {
+                        if wanted.contains(name) {
                             if let Some(default) = body
                                 .as_mapping()
                                 .and_then(|m| m.get(Value::String("default".into())))
@@ -512,18 +530,18 @@ fn collect_yaml_defaults(
                     .and_then(Value::as_str);
                 let default = port_config.get(Value::String("default".into()));
                 if let (Some(name), Some(default)) = (name, default) {
-                    if watched.contains(name) {
+                    if wanted.contains(name) {
                         defaults.insert(name.to_string(), yaml_scalar_to_string(default));
                     }
                 }
             }
             for child in map.values() {
-                collect_yaml_defaults(child, watched, defaults);
+                collect_yaml_defaults(child, wanted, defaults);
             }
         }
         Value::Sequence(seq) => {
             for child in seq {
-                collect_yaml_defaults(child, watched, defaults);
+                collect_yaml_defaults(child, wanted, defaults);
             }
         }
         _ => {}
@@ -535,6 +553,11 @@ fn yaml_scalar_to_string(value: &Value) -> String {
         Value::Number(n) => n.to_string(),
         Value::String(s) => s.clone(),
         Value::Bool(b) => b.to_string(),
+        Value::Sequence(seq) => seq
+            .iter()
+            .map(yaml_scalar_to_string)
+            .collect::<Vec<_>>()
+            .join(","),
         _ => format!("{value:?}"),
     }
 }
@@ -542,16 +565,15 @@ fn yaml_scalar_to_string(value: &Value) -> String {
 fn load_airframe_defaults(
     px4_source: &Path,
     sys_autostart: i32,
-    watched: &[&str],
+    wanted: &HashSet<String>,
 ) -> Result<HashMap<String, String>> {
-    let watched: HashSet<&str> = watched.iter().copied().collect();
     let airframes = px4_source.join("ROMFS/px4fmu_common/init.d/airframes");
     let Some(path) = find_airframe_script(&airframes, sys_autostart)? else {
         return Ok(HashMap::new());
     };
     let mut visited = HashSet::new();
-    let mut defaults = parse_airframe_script(px4_source, &path, &watched, &mut visited)?;
-    if watched.contains("SYS_AUTOSTART") {
+    let mut defaults = parse_airframe_script(px4_source, &path, wanted, &mut visited)?;
+    if wanted.contains("SYS_AUTOSTART") {
         defaults.insert("SYS_AUTOSTART".into(), sys_autostart.to_string());
     }
     Ok(defaults)
@@ -579,7 +601,7 @@ fn find_airframe_script(dir: &Path, sys_autostart: i32) -> Result<Option<PathBuf
 fn parse_airframe_script(
     px4_source: &Path,
     path: &Path,
-    watched: &HashSet<&str>,
+    wanted: &HashSet<String>,
     visited: &mut HashSet<PathBuf>,
 ) -> Result<HashMap<String, String>> {
     if !visited.insert(path.to_path_buf()) {
@@ -593,7 +615,7 @@ fn parse_airframe_script(
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() >= 4 && parts[0] == "param" && parts[1] == "set-default" {
             let name = parts[2];
-            if watched.contains(name) {
+            if wanted.contains(name) {
                 defaults.insert(name.to_string(), parts[3].to_string());
             }
         } else if parts.len() >= 2 && parts[0] == "." {
@@ -601,7 +623,7 @@ fn parse_airframe_script(
                 defaults.extend(parse_airframe_script(
                     px4_source,
                     &source_path,
-                    watched,
+                    wanted,
                     visited,
                 )?);
             }
@@ -642,24 +664,43 @@ fn build_recommendations(
     out
 }
 
-fn print_audit_table(
+fn build_audit_rows(
     params: &HashMap<String, ParamValue>,
     recommendations: &HashMap<String, Recommendation>,
-) {
+) -> Vec<AuditRow> {
     let protected: HashSet<&str> = PROTECTED_PARAMS.iter().copied().collect();
-    let mut table = Table::new();
+    let mut rows: Vec<AuditRow> = params
+        .iter()
+        .map(|(name, value)| {
+            let current = format_param(value);
+            let rec = recommendations.get(name);
+            let baseline = rec
+                .map(|r| r.value.clone())
+                .unwrap_or_else(|| "<unknown>".into());
+            let source = rec
+                .map(|r| r.source.clone())
+                .unwrap_or_else(|| "not found".into());
+            let status =
+                classify_status(name, &current, &baseline, protected.contains(name.as_str()));
+            AuditRow {
+                name: name.clone(),
+                current,
+                baseline,
+                source,
+                status,
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    rows
+}
+
+fn print_audit_table(rows: &[AuditRow]) {
+    let mut table = PlainTable::new();
     table.set_header(vec!["Param", "Device", "PX4 baseline", "Source", "Status"]);
 
-    for name in WATCHED_PARAMS {
-        let current = params
-            .get(*name)
-            .map(format_param)
-            .unwrap_or_else(|| "<missing>".into());
-        let rec = recommendations.get(*name);
-        let baseline = rec.map(|r| r.value.as_str()).unwrap_or("<unknown>");
-        let source = rec.map(|r| r.source.as_str()).unwrap_or("not found");
-        let status = classify_status(*name, &current, baseline, protected.contains(name));
-        let color = match status.as_str() {
+    for row in rows {
+        let color = match row.status.as_str() {
             "match" => Color::Green,
             "diff" => Color::Red,
             "diff protected" => Color::Yellow,
@@ -667,15 +708,294 @@ fn print_audit_table(
             _ => Color::White,
         };
         table.add_row(vec![
-            Cell::new(*name),
-            Cell::new(current),
-            Cell::new(baseline),
-            Cell::new(source),
-            Cell::new(status).fg(color),
+            Cell::new(&row.name),
+            Cell::new(&row.current),
+            Cell::new(&row.baseline),
+            Cell::new(&row.source),
+            Cell::new(&row.status).fg(color),
         ]);
     }
 
     println!("\n{table}");
+}
+
+struct TuiApp {
+    rows: Vec<AuditRow>,
+    filtered: Vec<usize>,
+    query: String,
+    search_mode: bool,
+    selected: usize,
+}
+
+impl TuiApp {
+    fn new(rows: Vec<AuditRow>) -> Self {
+        let filtered = (0..rows.len()).collect();
+        Self {
+            rows,
+            filtered,
+            query: String::new(),
+            search_mode: false,
+            selected: 0,
+        }
+    }
+
+    fn selected_row(&self) -> Option<&AuditRow> {
+        self.filtered
+            .get(self.selected)
+            .and_then(|index| self.rows.get(*index))
+    }
+
+    fn apply_filter(&mut self) {
+        let query = self.query.to_lowercase();
+        self.filtered = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| {
+                if query.is_empty()
+                    || row.name.to_lowercase().contains(&query)
+                    || row.current.to_lowercase().contains(&query)
+                    || row.baseline.to_lowercase().contains(&query)
+                    || row.source.to_lowercase().contains(&query)
+                    || row.status.to_lowercase().contains(&query)
+                {
+                    Some(index)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        self.clamp_selection();
+    }
+
+    fn clamp_selection(&mut self) {
+        if self.filtered.is_empty() {
+            self.selected = 0;
+        } else if self.selected >= self.filtered.len() {
+            self.selected = self.filtered.len() - 1;
+        }
+    }
+
+    fn move_down(&mut self, amount: usize) {
+        if !self.filtered.is_empty() {
+            self.selected = (self.selected + amount).min(self.filtered.len() - 1);
+        }
+    }
+
+    fn move_up(&mut self, amount: usize) {
+        self.selected = self.selected.saturating_sub(amount);
+    }
+}
+
+fn run_tui(rows: Vec<AuditRow>) -> Result<()> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+    let result = run_tui_loop(&mut terminal, TuiApp::new(rows));
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+    result
+}
+
+fn run_tui_loop(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    mut app: TuiApp,
+) -> Result<()> {
+    loop {
+        terminal.draw(|frame| draw_tui(frame, &app))?;
+
+        if !event::poll(Duration::from_millis(100))? {
+            continue;
+        }
+
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if handle_key(&mut app, key) {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn handle_key(app: &mut TuiApp, key: KeyEvent) -> bool {
+    if app.search_mode {
+        match key.code {
+            KeyCode::Esc => {
+                app.query.clear();
+                app.search_mode = false;
+                app.apply_filter();
+            }
+            KeyCode::Enter => app.search_mode = false,
+            KeyCode::Backspace => {
+                app.query.pop();
+                app.apply_filter();
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.query.clear();
+                app.apply_filter();
+            }
+            KeyCode::Char(c) => {
+                app.query.push(c);
+                app.apply_filter();
+            }
+            _ => {}
+        }
+        return false;
+    }
+
+    match key.code {
+        KeyCode::Char('q') => true,
+        KeyCode::Char('/') => {
+            app.search_mode = true;
+            false
+        }
+        KeyCode::Char('g') => {
+            app.selected = 0;
+            false
+        }
+        KeyCode::Char('G') => {
+            if !app.filtered.is_empty() {
+                app.selected = app.filtered.len() - 1;
+            }
+            false
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.move_down(1);
+            false
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.move_up(1);
+            false
+        }
+        KeyCode::PageDown => {
+            app.move_down(20);
+            false
+        }
+        KeyCode::PageUp => {
+            app.move_up(20);
+            false
+        }
+        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.move_down(20);
+            false
+        }
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.move_up(20);
+            false
+        }
+        KeyCode::Esc => {
+            app.query.clear();
+            app.apply_filter();
+            false
+        }
+        _ => false,
+    }
+}
+
+fn draw_tui(frame: &mut ratatui::Frame, app: &TuiApp) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(6),
+            Constraint::Length(4),
+        ])
+        .split(frame.area());
+
+    let search_title = if app.search_mode {
+        "Search (Enter done, Esc clear)"
+    } else {
+        "Search (/ to edit, Esc clear)"
+    };
+    let search_style = if app.search_mode {
+        Style::default().yellow()
+    } else {
+        Style::default()
+    };
+    let search = Paragraph::new(app.query.as_str())
+        .block(Block::default().borders(Borders::ALL).title(search_title))
+        .style(search_style);
+    frame.render_widget(search, chunks[0]);
+
+    let rows = app.filtered.iter().filter_map(|index| {
+        let row = app.rows.get(*index)?;
+        Some(Row::new(vec![
+            TuiCell::from(row.name.clone()),
+            TuiCell::from(row.current.clone()),
+            TuiCell::from(row.baseline.clone()),
+            TuiCell::from(row.source.clone()),
+            TuiCell::from(row.status.clone()).style(status_style(&row.status)),
+        ]))
+    });
+
+    let title = format!(
+        "PX4 Params - {} of {} shown",
+        app.filtered.len(),
+        app.rows.len()
+    );
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(22),
+            Constraint::Length(14),
+            Constraint::Length(18),
+            Constraint::Length(18),
+            Constraint::Min(14),
+        ],
+    )
+    .header(
+        Row::new(vec!["Param", "Device", "PX4 baseline", "Source", "Status"])
+            .style(Style::default().bold())
+            .bottom_margin(1),
+    )
+    .block(Block::default().borders(Borders::ALL).title(title))
+    .row_highlight_style(Style::default().reversed())
+    .highlight_symbol(">> ");
+
+    let mut state = TableState::default();
+    if !app.filtered.is_empty() {
+        state.select(Some(app.selected));
+    }
+    frame.render_stateful_widget(table, chunks[1], &mut state);
+
+    let detail = app
+        .selected_row()
+        .map(|row| {
+            vec![
+                Line::from(vec![
+                    Span::styled("Selected: ", Style::default().bold()),
+                    Span::raw(row.name.as_str()),
+                    Span::raw("  "),
+                    Span::styled(row.status.as_str(), status_style(&row.status)),
+                ]),
+                Line::from("Keys: q quit | / search | arrows/j/k scroll | PgUp/PgDn or Ctrl-u/Ctrl-d | g/G top/bottom"),
+            ]
+        })
+        .unwrap_or_else(|| {
+            vec![
+                Line::from("No matching parameters"),
+                Line::from("Keys: q quit | / search | Esc clear search"),
+            ]
+        });
+
+    frame.render_widget(
+        Paragraph::new(detail).block(Block::default().borders(Borders::ALL).title("Status")),
+        chunks[2],
+    );
+}
+
+fn status_style(status: &str) -> Style {
+    match status {
+        "match" => Style::default().green(),
+        "diff" => Style::default().red(),
+        "diff protected" => Style::default().yellow(),
+        "unknown" => Style::default().dark_gray(),
+        _ => Style::default(),
+    }
 }
 
 fn format_param(param: &ParamValue) -> String {

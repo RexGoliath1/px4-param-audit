@@ -7,7 +7,9 @@ edition = "2024"
 anyhow = "1.0.103"
 clap = { version = "4.6.1", features = ["derive"] }
 comfy-table = "7.2.2"
+crossterm = "0.29.0"
 mavlink = { version = "0.18.0", features = ["dialect-common"] }
+ratatui = "0.30.2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_yaml = "0.9.34"
 serialport = "4.9.0"
