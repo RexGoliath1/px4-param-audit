@@ -2,16 +2,18 @@
 
 PX4 parameter audit and explicit write tool for multirotors.
 
-The first target is Pixhawk/Holybro over MAVLink serial. Starling/VOXL support is
-intentionally out of scope for the MVP.
+The first target is Pixhawk/Holybro over MAVLink serial. MAVLink UDP/TCP is
+also supported for remote links. Starling/VOXL support still needs a ModalAI
+baseline provider.
 
 ## Current MVP
 
-- Connects to PX4 over MAVLink serial.
+- Connects to PX4 over MAVLink serial, UDP, or TCP.
 - Reads heartbeat vehicle identity.
 - Requests `AUTOPILOT_VERSION`.
 - Requests the full parameter list.
-- Parses PX4 firmware defaults from a local `PX4-Autopilot` checkout.
+- Parses PX4 firmware defaults from the pinned `vendor/PX4-Autopilot`
+  submodule by default.
 - Parses matching airframe defaults from `SYS_AUTOSTART` or `--sys-autostart`.
 - Opens a scrollable/searchable terminal UI listing every parameter read from
   the device.
@@ -21,6 +23,12 @@ Normal browse/audit mode does not write parameters. Writes only happen through
 write flags and require confirmation unless `--yes` is supplied.
 
 ## Build
+
+Initialize the pinned PX4 baseline source:
+
+```bash
+git submodule update --init --depth 1 vendor/PX4-Autopilot
+```
 
 Build a compiled executable:
 
@@ -49,6 +57,20 @@ port open and the audit tool cannot connect while QGC owns it.
 px4-param-audit --connect serial:/dev/cu.usbmodem01:57600
 ```
 
+Supported connection strings:
+
+```text
+serial:/dev/ttyACM0:57600
+udp-listen:0.0.0.0:14550
+udp-connect:192.168.8.1:14550
+udp:192.168.8.1:14550
+tcp:192.168.8.1:5760
+```
+
+Use `udp-listen` when the drone or MAVLink router is configured to send
+MAVLink to this computer. Use `udp-connect`/`udp` or `tcp` when this tool should
+initiate traffic to a known endpoint.
+
 If `--connect` is omitted, the tool autodiscovers a PX4/Pixhawk USB serial
 port and uses baud `57600`.
 
@@ -76,8 +98,11 @@ Use a specific PX4 source checkout for baseline defaults:
 ```bash
 px4-param-audit \
   --connect serial:/dev/cu.usbmodem01:57600 \
-  --px4-source /Users/gonk/git/PX4-Autopilot
+  --px4-source /path/to/PX4-Autopilot
 ```
+
+If `--px4-source` is omitted, the tool uses `vendor/PX4-Autopilot`. You can
+also set `PX4_PARAM_AUDIT_PX4_SOURCE=/path/to/PX4-Autopilot`.
 
 If the device reports `SYS_AUTOSTART=0`, the tool cannot infer a PX4 airframe
 baseline from the vehicle. You can still compare read-only against a known PX4
@@ -179,6 +204,10 @@ PX4 firmware YAML defaults
 If `--sys-autostart` is supplied, that airframe ID is used for the comparison
 baseline instead of the device's reported `SYS_AUTOSTART`. Supplying a baseline
 only changes comparison output; it does not write by itself.
+
+The selected PX4 checkout path and git commit are printed at startup. Treat
+diffs as authoritative only when the baseline source matches the PX4 version you
+intend to compare against.
 
 If a parameter default cannot be found in local PX4 source, the table reports
 `<unknown>` rather than guessing.

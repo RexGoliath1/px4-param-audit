@@ -19,7 +19,9 @@ use serialport::{SerialPort, SerialPortInfo, SerialPortType, UsbPortInfo};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, ErrorKind, IsTerminal, Read, Write};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -29,13 +31,13 @@ use std::time::{Duration, Instant};
     about = "PX4 parameter audit and explicit write tool for multirotors"
 )]
 struct Args {
-    /// MAVLink connection string. Use `serial:/dev/cu.usbmodem01:57600` for Pixhawk USB.
+    /// MAVLink connection string. Supports serial, udp-listen, udp-connect/udp, and tcp.
     #[arg(short, long)]
     connect: Option<String>,
 
     /// PX4-Autopilot source checkout used to derive firmware defaults and airframe defaults.
-    #[arg(long, default_value = "/Users/gonk/git/PX4-Autopilot")]
-    px4_source: PathBuf,
+    #[arg(long)]
+    px4_source: Option<PathBuf>,
 
     /// Compare against this PX4 airframe ID instead of the device SYS_AUTOSTART.
     #[arg(long)]
@@ -124,14 +126,15 @@ fn main() -> Result<()> {
         Some(connect) => connect,
         None => default_connection()?,
     };
+    let px4_source = resolve_px4_source(args.px4_source.as_deref())?;
 
     println!("connecting: {connect}");
     let mut conn =
-        MavSerial::open(&connect).with_context(|| format!("failed to connect to {connect}"))?;
+        open_transport(&connect).with_context(|| format!("failed to connect to {connect}"))?;
 
-    let identity = wait_for_heartbeat(&mut conn, Duration::from_secs(10))?;
-    request_autopilot_version(&mut conn, &identity)?;
-    let version = wait_for_autopilot_version(&mut conn, Duration::from_secs(3));
+    let identity = wait_for_heartbeat(&mut *conn, Duration::from_secs(10))?;
+    request_autopilot_version(&mut *conn, &identity)?;
+    let version = wait_for_autopilot_version(&mut *conn, Duration::from_secs(3));
     let identity = VehicleIdentity {
         version,
         ..identity
@@ -139,29 +142,30 @@ fn main() -> Result<()> {
 
     print_identity(&identity);
 
-    request_params(&mut conn, &identity)?;
-    let params = collect_params(&mut conn, Duration::from_secs(args.param_timeout))?;
+    request_params(&mut *conn, &identity)?;
+    let params = collect_params(&mut *conn, Duration::from_secs(args.param_timeout))?;
     println!("received {} parameters", params.len());
 
     let device_sys_autostart = params.get("SYS_AUTOSTART").map(|p| p.value.round() as i32);
     let baseline_sys_autostart = args.sys_autostart.or(device_sys_autostart);
     let wanted_params: HashSet<String> = params.keys().cloned().collect();
-    let firmware_defaults = load_firmware_defaults(&args.px4_source, &wanted_params)?;
+    let firmware_defaults = load_firmware_defaults(&px4_source, &wanted_params)?;
     let airframe_defaults = if let Some(id) = baseline_sys_autostart {
-        load_airframe_defaults(&args.px4_source, id, &wanted_params)?
+        load_airframe_defaults(&px4_source, id, &wanted_params)?
     } else {
         HashMap::new()
     };
 
     let recommendations = build_recommendations(firmware_defaults, airframe_defaults);
-    print_baseline(device_sys_autostart, args.sys_autostart, &args.px4_source)?;
+    print_baseline(device_sys_autostart, args.sys_autostart, &px4_source)?;
+    print_px4_source(&px4_source);
     let rows = build_audit_rows(&params, &recommendations);
 
     if args.write_diffs || !args.set_params.is_empty() {
         let writes = build_write_plan(&args, &params, &rows)?;
         confirm_writes(&writes, args.yes)?;
         apply_writes(
-            &mut conn,
+            &mut *conn,
             &identity,
             writes,
             Duration::from_secs(args.write_timeout),
@@ -171,14 +175,14 @@ fn main() -> Result<()> {
     }
 
     if args.verbose {
-        println!("\nPX4 source: {}", args.px4_source.display());
+        println!("\nPX4 source: {}", px4_source.display());
     }
 
     if args.plain || !io::stdout().is_terminal() {
         print_audit_table(&rows);
     } else {
         run_tui(
-            &mut conn,
+            &mut *conn,
             &identity,
             rows,
             Duration::from_secs(args.write_timeout),
@@ -202,6 +206,57 @@ fn default_connection() -> Result<String> {
     }
 
     bail!("could not autodiscover a PX4 USB serial port; pass --connect or run --list-ports")
+}
+
+fn resolve_px4_source(explicit: Option<&Path>) -> Result<PathBuf> {
+    if let Some(path) = explicit {
+        return validate_px4_source(path);
+    }
+
+    if let Ok(path) = std::env::var("PX4_PARAM_AUDIT_PX4_SOURCE") {
+        return validate_px4_source(Path::new(&path));
+    }
+
+    for candidate in [
+        PathBuf::from("vendor/PX4-Autopilot"),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("vendor/PX4-Autopilot"),
+    ] {
+        if candidate.exists() {
+            return validate_px4_source(&candidate);
+        }
+    }
+
+    bail!(
+        "could not find PX4-Autopilot baseline source; initialize the vendor/PX4-Autopilot submodule or pass --px4-source"
+    )
+}
+
+fn validate_px4_source(path: &Path) -> Result<PathBuf> {
+    let source = path.to_path_buf();
+    ensure!(
+        source.join("src").is_dir() && source.join("ROMFS/px4fmu_common/init.d/airframes").is_dir(),
+        "{} does not look like a PX4-Autopilot checkout",
+        source.display()
+    );
+    Ok(source)
+}
+
+fn print_px4_source(px4_source: &Path) {
+    let git = Command::new("git")
+        .arg("-C")
+        .arg(px4_source)
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .and_then(|output| {
+            output
+                .status
+                .success()
+                .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".into());
+    println!("PX4 baseline source: {} git={git}", px4_source.display());
 }
 
 fn discover_px4_serial_port() -> Result<Option<String>> {
@@ -320,55 +375,24 @@ fn print_serial_ports() -> Result<()> {
     Ok(())
 }
 
-struct MavSerial {
-    port: Box<dyn SerialPort>,
-    rx_buf: Vec<u8>,
-    sequence: u8,
+trait MavTransport {
+    fn send(&mut self, msg: &common::MavMessage) -> Result<()>;
+    fn recv(&mut self) -> Option<(MavHeader, common::MavMessage)>;
 }
 
-impl MavSerial {
-    fn open(connect: &str) -> Result<Self> {
-        let (path, baud) = parse_serial_connection(connect)?;
-        let port = serialport::new(path, baud)
-            .timeout(Duration::from_millis(10))
-            .open()?;
-        Ok(Self {
-            port,
+struct FrameDecoder {
+    rx_buf: Vec<u8>,
+}
+
+impl FrameDecoder {
+    fn new() -> Self {
+        Self {
             rx_buf: Vec::with_capacity(4096),
-            sequence: 0,
-        })
-    }
-
-    fn send(&mut self, msg: &common::MavMessage) -> Result<()> {
-        let header = MavHeader {
-            system_id: 255,
-            component_id: 190,
-            sequence: self.sequence,
-        };
-        self.sequence = self.sequence.wrapping_add(1);
-        mavlink::write_versioned_msg(&mut self.port, MavlinkVersion::V2, header, msg)?;
-        Ok(())
-    }
-
-    fn recv(&mut self) -> Option<(MavHeader, common::MavMessage)> {
-        self.read_available();
-        self.decode_next_frame()
-    }
-
-    fn read_available(&mut self) {
-        let Ok(available) = self.port.bytes_to_read() else {
-            return;
-        };
-        if available == 0 {
-            return;
         }
+    }
 
-        let mut buf = vec![0_u8; (available as usize).min(8192)];
-        match self.port.read(&mut buf) {
-            Ok(n) => self.rx_buf.extend_from_slice(&buf[..n]),
-            Err(err) if matches!(err.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => {}
-            Err(_) => {}
-        }
+    fn extend(&mut self, bytes: &[u8]) {
+        self.rx_buf.extend_from_slice(bytes);
     }
 
     fn decode_next_frame(&mut self) -> Option<(MavHeader, common::MavMessage)> {
@@ -401,6 +425,179 @@ impl MavSerial {
     }
 }
 
+struct MavSerial {
+    port: Box<dyn SerialPort>,
+    decoder: FrameDecoder,
+    sequence: u8,
+}
+
+impl MavSerial {
+    fn open(path: &str, baud: u32) -> Result<Self> {
+        let port = serialport::new(path, baud)
+            .timeout(Duration::from_millis(10))
+            .open()?;
+        Ok(Self {
+            port,
+            decoder: FrameDecoder::new(),
+            sequence: 0,
+        })
+    }
+}
+
+impl MavTransport for MavSerial {
+    fn send(&mut self, msg: &common::MavMessage) -> Result<()> {
+        write_mavlink_message(&mut self.port, &mut self.sequence, msg)?;
+        Ok(())
+    }
+
+    fn recv(&mut self) -> Option<(MavHeader, common::MavMessage)> {
+        self.read_available();
+        self.decoder.decode_next_frame()
+    }
+}
+
+impl MavSerial {
+    fn read_available(&mut self) {
+        let Ok(available) = self.port.bytes_to_read() else {
+            return;
+        };
+        if available == 0 {
+            return;
+        }
+
+        let mut buf = vec![0_u8; (available as usize).min(8192)];
+        match self.port.read(&mut buf) {
+            Ok(n) => self.decoder.extend(&buf[..n]),
+            Err(err) if matches!(err.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => {}
+            Err(_) => {}
+        }
+    }
+}
+
+struct MavTcp {
+    stream: TcpStream,
+    decoder: FrameDecoder,
+    sequence: u8,
+}
+
+impl MavTcp {
+    fn open(addr: &str) -> Result<Self> {
+        let stream = TcpStream::connect(resolve_socket_addr(addr)?)?;
+        stream.set_nonblocking(true)?;
+        Ok(Self {
+            stream,
+            decoder: FrameDecoder::new(),
+            sequence: 0,
+        })
+    }
+
+    fn read_available(&mut self) {
+        let mut buf = [0_u8; 4096];
+        loop {
+            match self.stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => self.decoder.extend(&buf[..n]),
+                Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+    }
+}
+
+impl MavTransport for MavTcp {
+    fn send(&mut self, msg: &common::MavMessage) -> Result<()> {
+        self.stream.set_nonblocking(false)?;
+        let result = write_mavlink_message(&mut self.stream, &mut self.sequence, msg);
+        self.stream.set_nonblocking(true)?;
+        result
+    }
+
+    fn recv(&mut self) -> Option<(MavHeader, common::MavMessage)> {
+        self.read_available();
+        self.decoder.decode_next_frame()
+    }
+}
+
+struct MavUdp {
+    socket: UdpSocket,
+    peer: Option<SocketAddr>,
+    decoder: FrameDecoder,
+    sequence: u8,
+}
+
+impl MavUdp {
+    fn listen(addr: &str) -> Result<Self> {
+        let socket = UdpSocket::bind(addr)?;
+        socket.set_nonblocking(true)?;
+        Ok(Self {
+            socket,
+            peer: None,
+            decoder: FrameDecoder::new(),
+            sequence: 0,
+        })
+    }
+
+    fn connect(addr: &str) -> Result<Self> {
+        let peer = resolve_socket_addr(addr)?;
+        let socket = UdpSocket::bind("0.0.0.0:0")?;
+        socket.set_nonblocking(true)?;
+        Ok(Self {
+            socket,
+            peer: Some(peer),
+            decoder: FrameDecoder::new(),
+            sequence: 0,
+        })
+    }
+
+    fn read_available(&mut self) {
+        let mut buf = [0_u8; 4096];
+        loop {
+            match self.socket.recv_from(&mut buf) {
+                Ok((n, addr)) => {
+                    self.peer = Some(addr);
+                    self.decoder.extend(&buf[..n]);
+                }
+                Err(err) if err.kind() == ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
+    }
+}
+
+impl MavTransport for MavUdp {
+    fn send(&mut self, msg: &common::MavMessage) -> Result<()> {
+        let Some(peer) = self.peer else {
+            return Ok(());
+        };
+        let mut buf = Vec::with_capacity(280);
+        write_mavlink_message(&mut buf, &mut self.sequence, msg)?;
+        self.socket.send_to(&buf, peer)?;
+        Ok(())
+    }
+
+    fn recv(&mut self) -> Option<(MavHeader, common::MavMessage)> {
+        self.read_available();
+        self.decoder.decode_next_frame()
+    }
+}
+
+fn write_mavlink_message<W: Write>(
+    writer: &mut W,
+    sequence: &mut u8,
+    msg: &common::MavMessage,
+) -> Result<()> {
+    let header = MavHeader {
+        system_id: 255,
+        component_id: 190,
+        sequence: *sequence,
+    };
+    *sequence = sequence.wrapping_add(1);
+    mavlink::write_versioned_msg(writer, MavlinkVersion::V2, header, msg)?;
+    Ok(())
+}
+
 fn decode_mavlink_frame(frame: &[u8]) -> Option<(MavHeader, common::MavMessage)> {
     match frame.first().copied()? {
         0xfe => {
@@ -431,9 +628,31 @@ fn decode_mavlink_frame(frame: &[u8]) -> Option<(MavHeader, common::MavMessage)>
     }
 }
 
+fn open_transport(connect: &str) -> Result<Box<dyn MavTransport>> {
+    if connect.starts_with("serial:") {
+        let (path, baud) = parse_serial_connection(connect)?;
+        return Ok(Box::new(MavSerial::open(path, baud)?));
+    }
+    if let Some(addr) = connect.strip_prefix("udp-listen:") {
+        return Ok(Box::new(MavUdp::listen(addr)?));
+    }
+    if let Some(addr) = connect.strip_prefix("udp-connect:") {
+        return Ok(Box::new(MavUdp::connect(addr)?));
+    }
+    if let Some(addr) = connect.strip_prefix("udp:") {
+        return Ok(Box::new(MavUdp::connect(addr)?));
+    }
+    if let Some(addr) = connect.strip_prefix("tcp:") {
+        return Ok(Box::new(MavTcp::open(addr)?));
+    }
+    bail!(
+        "unsupported connection string; use serial:<path>:<baud>, udp-listen:<ip>:<port>, udp-connect:<host>:<port>, udp:<host>:<port>, or tcp:<host>:<port>"
+    )
+}
+
 fn parse_serial_connection(connect: &str) -> Result<(&str, u32)> {
     let Some(rest) = connect.strip_prefix("serial:") else {
-        bail!("only serial: connection strings are implemented in the MVP");
+        bail!("serial connection must start with serial:");
     };
     let Some((path, baud)) = rest.rsplit_once(':') else {
         bail!("serial connection must look like serial:/dev/cu.usbmodem01:57600");
@@ -441,7 +660,13 @@ fn parse_serial_connection(connect: &str) -> Result<(&str, u32)> {
     Ok((path, baud.parse()?))
 }
 
-fn wait_for_heartbeat(conn: &mut MavSerial, timeout: Duration) -> Result<VehicleIdentity> {
+fn resolve_socket_addr(addr: &str) -> Result<SocketAddr> {
+    addr.to_socket_addrs()?
+        .next()
+        .with_context(|| format!("could not resolve socket address {addr}"))
+}
+
+fn wait_for_heartbeat(conn: &mut dyn MavTransport, timeout: Duration) -> Result<VehicleIdentity> {
     let deadline = Instant::now() + timeout;
     let mut next_gcs_heartbeat = Instant::now();
     while Instant::now() < deadline {
@@ -469,7 +694,7 @@ fn wait_for_heartbeat(conn: &mut MavSerial, timeout: Duration) -> Result<Vehicle
     bail!("timed out waiting for MAVLink heartbeat");
 }
 
-fn send_gcs_heartbeat(conn: &mut MavSerial) -> Result<()> {
+fn send_gcs_heartbeat(conn: &mut dyn MavTransport) -> Result<()> {
     let msg = common::MavMessage::HEARTBEAT(common::HEARTBEAT_DATA {
         custom_mode: 0,
         mavtype: common::MavType::MAV_TYPE_GCS,
@@ -482,7 +707,10 @@ fn send_gcs_heartbeat(conn: &mut MavSerial) -> Result<()> {
     Ok(())
 }
 
-fn request_autopilot_version(conn: &mut MavSerial, identity: &VehicleIdentity) -> Result<()> {
+fn request_autopilot_version(
+    conn: &mut dyn MavTransport,
+    identity: &VehicleIdentity,
+) -> Result<()> {
     let msg = common::MavMessage::COMMAND_LONG(common::COMMAND_LONG_DATA {
         target_system: identity.system_id,
         target_component: identity.component_id,
@@ -501,7 +729,7 @@ fn request_autopilot_version(conn: &mut MavSerial, identity: &VehicleIdentity) -
 }
 
 fn wait_for_autopilot_version(
-    conn: &mut MavSerial,
+    conn: &mut dyn MavTransport,
     timeout: Duration,
 ) -> Option<common::AUTOPILOT_VERSION_DATA> {
     let deadline = Instant::now() + timeout;
@@ -515,7 +743,7 @@ fn wait_for_autopilot_version(
     None
 }
 
-fn request_params(conn: &mut MavSerial, identity: &VehicleIdentity) -> Result<()> {
+fn request_params(conn: &mut dyn MavTransport, identity: &VehicleIdentity) -> Result<()> {
     let msg = common::MavMessage::PARAM_REQUEST_LIST(common::PARAM_REQUEST_LIST_DATA {
         target_system: identity.system_id,
         target_component: identity.component_id,
@@ -524,7 +752,10 @@ fn request_params(conn: &mut MavSerial, identity: &VehicleIdentity) -> Result<()
     Ok(())
 }
 
-fn collect_params(conn: &mut MavSerial, timeout: Duration) -> Result<HashMap<String, ParamValue>> {
+fn collect_params(
+    conn: &mut dyn MavTransport,
+    timeout: Duration,
+) -> Result<HashMap<String, ParamValue>> {
     let deadline = Instant::now() + timeout;
     let mut params = HashMap::new();
     while Instant::now() < deadline {
@@ -659,7 +890,7 @@ fn confirm_writes(writes: &[WriteRequest], yes: bool) -> Result<()> {
 }
 
 fn apply_writes(
-    conn: &mut MavSerial,
+    conn: &mut dyn MavTransport,
     identity: &VehicleIdentity,
     writes: Vec<WriteRequest>,
     timeout: Duration,
@@ -674,7 +905,7 @@ fn apply_writes(
 }
 
 fn send_param_set(
-    conn: &mut MavSerial,
+    conn: &mut dyn MavTransport,
     identity: &VehicleIdentity,
     write: &WriteRequest,
 ) -> Result<()> {
@@ -690,7 +921,7 @@ fn send_param_set(
 }
 
 fn wait_for_param_confirmation(
-    conn: &mut MavSerial,
+    conn: &mut dyn MavTransport,
     name: &str,
     timeout: Duration,
 ) -> Result<ParamValue> {
@@ -1158,7 +1389,7 @@ impl TuiApp {
 }
 
 fn run_tui(
-    conn: &mut MavSerial,
+    conn: &mut dyn MavTransport,
     identity: &VehicleIdentity,
     rows: Vec<AuditRow>,
     write_timeout: Duration,
@@ -1183,7 +1414,7 @@ fn run_tui(
 
 fn run_tui_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    conn: &mut MavSerial,
+    conn: &mut dyn MavTransport,
     identity: &VehicleIdentity,
     mut app: TuiApp,
     write_timeout: Duration,
