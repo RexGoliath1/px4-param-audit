@@ -57,6 +57,11 @@ port open and the audit tool cannot connect while QGC owns it.
 px4-param-audit --connect serial:/dev/cu.usbmodem01:57600
 ```
 
+To keep QGC open, do not have QGC own the USB serial port directly. Put a
+MAVLink router/proxy in front of the Pixhawk and connect both QGC and this tool
+to separate UDP/TCP endpoints from that router. The tool already supports
+`udp-listen`, `udp-connect`/`udp`, and `tcp` connection strings for that setup.
+
 Supported connection strings:
 
 ```text

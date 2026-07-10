@@ -921,11 +921,13 @@ fn send_param_set(
     identity: &VehicleIdentity,
     write: &WriteRequest,
 ) -> Result<()> {
+    let param_value = encode_param_set_value(write.value, write.mav_type)
+        .with_context(|| format!("cannot encode {} for {:?}", write.name, write.mav_type))?;
     let msg = common::MavMessage::PARAM_SET(common::PARAM_SET_DATA {
         target_system: identity.system_id,
         target_component: identity.component_id,
         param_id: write.name.as_str().into(),
-        param_value: write.value,
+        param_value,
         param_type: write.mav_type,
     });
     conn.send(&msg)?;
@@ -1919,17 +1921,74 @@ fn status_style(status: &str) -> Style {
 
 fn format_param(param: &ParamValue) -> String {
     match param.mav_type {
-        common::MavParamType::MAV_PARAM_TYPE_UINT8
-        | common::MavParamType::MAV_PARAM_TYPE_INT8
-        | common::MavParamType::MAV_PARAM_TYPE_UINT16
-        | common::MavParamType::MAV_PARAM_TYPE_INT16
-        | common::MavParamType::MAV_PARAM_TYPE_UINT32
-        | common::MavParamType::MAV_PARAM_TYPE_INT32 => format!("{}", param.value.round() as i64),
+        common::MavParamType::MAV_PARAM_TYPE_UINT8 => format!("{}", param.value.to_bits() & 0xff),
+        common::MavParamType::MAV_PARAM_TYPE_INT8 => {
+            format!("{}", (param.value.to_bits() as u8) as i8)
+        }
+        common::MavParamType::MAV_PARAM_TYPE_UINT16 => {
+            format!("{}", param.value.to_bits() & 0xffff)
+        }
+        common::MavParamType::MAV_PARAM_TYPE_INT16 => {
+            format!("{}", (param.value.to_bits() as u16) as i16)
+        }
+        common::MavParamType::MAV_PARAM_TYPE_UINT32 => format!("{}", param.value.to_bits()),
+        common::MavParamType::MAV_PARAM_TYPE_INT32 => format!("{}", param.value.to_bits() as i32),
         _ => {
             let s = format!("{:.6}", param.value);
             s.trim_end_matches('0').trim_end_matches('.').to_string()
         }
     }
+}
+
+fn encode_param_set_value(value: f32, mav_type: common::MavParamType) -> Result<f32> {
+    match mav_type {
+        common::MavParamType::MAV_PARAM_TYPE_UINT8 => {
+            Ok(f32::from_bits(
+                checked_integer(value, 0, u8::MAX as i64)? as u8 as u32,
+            ))
+        }
+        common::MavParamType::MAV_PARAM_TYPE_INT8 => {
+            Ok(f32::from_bits(
+                checked_integer(value, i8::MIN as i64, i8::MAX as i64)? as i8 as u8 as u32,
+            ))
+        }
+        common::MavParamType::MAV_PARAM_TYPE_UINT16 => {
+            Ok(f32::from_bits(
+                checked_integer(value, 0, u16::MAX as i64)? as u16 as u32,
+            ))
+        }
+        common::MavParamType::MAV_PARAM_TYPE_INT16 => {
+            Ok(f32::from_bits(
+                checked_integer(value, i16::MIN as i64, i16::MAX as i64)? as i16 as u16 as u32,
+            ))
+        }
+        common::MavParamType::MAV_PARAM_TYPE_UINT32 => {
+            Ok(f32::from_bits(
+                checked_integer(value, 0, u32::MAX as i64)? as u32
+            ))
+        }
+        common::MavParamType::MAV_PARAM_TYPE_INT32 => {
+            Ok(f32::from_bits(
+                checked_integer(value, i32::MIN as i64, i32::MAX as i64)? as i32 as u32,
+            ))
+        }
+        _ => Ok(value),
+    }
+}
+
+fn checked_integer(value: f32, min: i64, max: i64) -> Result<i64> {
+    ensure!(value.is_finite(), "integer parameter value must be finite");
+    let rounded = value.round();
+    ensure!(
+        (value - rounded).abs() <= f32::EPSILON,
+        "integer parameter value must be whole: {value}"
+    );
+    let integer = rounded as i64;
+    ensure!(
+        integer >= min && integer <= max,
+        "integer parameter value {integer} is outside [{min}, {max}]"
+    );
+    Ok(integer)
 }
 
 fn classify_status(current: &str, baseline: &str) -> String {
@@ -2000,5 +2059,32 @@ serial_ports = {
             ),
             ("GPS1".into(), None)
         );
+    }
+
+    #[test]
+    fn encodes_px4_int32_param_sets_bytewise() {
+        let encoded = encode_param_set_value(7.0, common::MavParamType::MAV_PARAM_TYPE_INT32)
+            .expect("encode int32");
+
+        assert_eq!(encoded.to_bits(), 7);
+        assert_ne!(encoded.to_bits(), 7.0f32.to_bits());
+    }
+
+    #[test]
+    fn formats_px4_int32_param_values_bytewise() {
+        let param = ParamValue {
+            value: f32::from_bits(7),
+            mav_type: common::MavParamType::MAV_PARAM_TYPE_INT32,
+        };
+
+        assert_eq!(format_param(&param), "7");
+    }
+
+    #[test]
+    fn rejects_fractional_integer_writes() {
+        let err = encode_param_set_value(7.5, common::MavParamType::MAV_PARAM_TYPE_INT32)
+            .expect_err("fractional int write should fail");
+
+        assert!(err.to_string().contains("must be whole"));
     }
 }
