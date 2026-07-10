@@ -86,7 +86,19 @@ You can also run through Cargo during development:
 cargo run -- --connect serial:/dev/cu.usbmodem01:57600 --sys-autostart 4019
 ```
 
-## Writes
+## TUI Editing
+
+The TUI can edit device values directly:
+
+- Select a parameter row.
+- Press `e` or `Enter`.
+- Type a numeric value.
+- Press `Enter` to write it with MAVLink `PARAM_SET`.
+- Press `Esc` to cancel editing.
+
+After PX4 confirms the write, the device value and status update in the table.
+
+## CLI Writes
 
 Write a single numeric parameter:
 
@@ -124,9 +136,10 @@ MAVLink parameter value is known.
 ## TUI Keys
 
 - `q`: quit
+- `e` / `Enter`: edit selected device value
 - `/`: edit search
 - `Enter`: leave search mode
-- `Esc`: clear search
+- `Esc`: clear search or cancel editing
 - `Up` / `Down` or `k` / `j`: move selection
 - `PageUp` / `PageDown` or `Ctrl-u` / `Ctrl-d`: page
 - `g` / `G`: top / bottom

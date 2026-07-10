@@ -165,7 +165,12 @@ fn main() -> Result<()> {
     if args.plain || !io::stdout().is_terminal() {
         print_audit_table(&rows);
     } else {
-        run_tui(rows)?;
+        run_tui(
+            &mut conn,
+            &identity,
+            rows,
+            Duration::from_secs(args.write_timeout),
+        )?;
     }
 
     Ok(())
@@ -911,8 +916,23 @@ struct TuiApp {
     rows: Vec<AuditRow>,
     filtered: Vec<usize>,
     query: String,
-    search_mode: bool,
+    edit_value: String,
+    mode: TuiMode,
     selected: usize,
+    status_message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TuiMode {
+    Browse,
+    Search,
+    Edit,
+}
+
+enum TuiAction {
+    Continue,
+    Quit,
+    Write(WriteRequest),
 }
 
 impl TuiApp {
@@ -922,8 +942,10 @@ impl TuiApp {
             rows,
             filtered,
             query: String::new(),
-            search_mode: false,
+            edit_value: String::new(),
+            mode: TuiMode::Browse,
             selected: 0,
+            status_message: "Browse: e/Enter edit selected value, / search, q quit".into(),
         }
     }
 
@@ -931,6 +953,11 @@ impl TuiApp {
         self.filtered
             .get(self.selected)
             .and_then(|index| self.rows.get(*index))
+    }
+
+    fn selected_row_mut(&mut self) -> Option<&mut AuditRow> {
+        let index = *self.filtered.get(self.selected)?;
+        self.rows.get_mut(index)
     }
 
     fn apply_filter(&mut self) {
@@ -973,15 +1000,46 @@ impl TuiApp {
     fn move_up(&mut self, amount: usize) {
         self.selected = self.selected.saturating_sub(amount);
     }
+
+    fn start_edit(&mut self) {
+        if let Some(row) = self.selected_row() {
+            let name = row.name.clone();
+            let current = row.current.clone();
+            self.edit_value = current;
+            self.mode = TuiMode::Edit;
+            self.status_message = format!("Editing {name}. Enter writes, Esc cancels.");
+        }
+    }
+
+    fn update_selected_value(&mut self, confirmed: ParamValue) {
+        if let Some(row) = self.selected_row_mut() {
+            row.current = format_param(&confirmed);
+            row.mav_type = confirmed.mav_type;
+            row.status = classify_status(&row.current, &row.baseline);
+            self.status_message = format!("Set {} = {}", row.name, row.current);
+        }
+        self.apply_filter();
+    }
 }
 
-fn run_tui(rows: Vec<AuditRow>) -> Result<()> {
+fn run_tui(
+    conn: &mut MavSerial,
+    identity: &VehicleIdentity,
+    rows: Vec<AuditRow>,
+    write_timeout: Duration,
+) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    let result = run_tui_loop(&mut terminal, TuiApp::new(rows));
+    let result = run_tui_loop(
+        &mut terminal,
+        conn,
+        identity,
+        TuiApp::new(rows),
+        write_timeout,
+    );
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
@@ -990,7 +1048,10 @@ fn run_tui(rows: Vec<AuditRow>) -> Result<()> {
 
 fn run_tui_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    conn: &mut MavSerial,
+    identity: &VehicleIdentity,
     mut app: TuiApp,
+    write_timeout: Duration,
 ) -> Result<()> {
     loop {
         terminal.draw(|frame| draw_tui(frame, &app))?;
@@ -1002,22 +1063,41 @@ fn run_tui_loop(
         let Event::Key(key) = event::read()? else {
             continue;
         };
-        if handle_key(&mut app, key) {
-            break;
+        match handle_key(&mut app, key) {
+            TuiAction::Continue => {}
+            TuiAction::Quit => break,
+            TuiAction::Write(write) => {
+                app.status_message = format!("Writing {} = {}...", write.name, write.value);
+                terminal.draw(|frame| draw_tui(frame, &app))?;
+                match send_param_set(conn, identity, &write).and_then(|_| {
+                    wait_for_param_confirmation(conn, &write.name, write_timeout)
+                        .with_context(|| format!("PX4 did not confirm {}", write.name))
+                }) {
+                    Ok(confirmed) => {
+                        app.update_selected_value(confirmed);
+                        app.mode = TuiMode::Browse;
+                        app.edit_value.clear();
+                    }
+                    Err(err) => {
+                        app.status_message = format!("Write failed: {err:#}");
+                        app.mode = TuiMode::Browse;
+                    }
+                }
+            }
         }
     }
     Ok(())
 }
 
-fn handle_key(app: &mut TuiApp, key: KeyEvent) -> bool {
-    if app.search_mode {
+fn handle_key(app: &mut TuiApp, key: KeyEvent) -> TuiAction {
+    if app.mode == TuiMode::Search {
         match key.code {
             KeyCode::Esc => {
                 app.query.clear();
-                app.search_mode = false;
+                app.mode = TuiMode::Browse;
                 app.apply_filter();
             }
-            KeyCode::Enter => app.search_mode = false,
+            KeyCode::Enter => app.mode = TuiMode::Browse,
             KeyCode::Backspace => {
                 app.query.pop();
                 app.apply_filter();
@@ -1032,55 +1112,96 @@ fn handle_key(app: &mut TuiApp, key: KeyEvent) -> bool {
             }
             _ => {}
         }
-        return false;
+        return TuiAction::Continue;
+    }
+
+    if app.mode == TuiMode::Edit {
+        match key.code {
+            KeyCode::Esc => {
+                app.mode = TuiMode::Browse;
+                app.edit_value.clear();
+                app.status_message = "Edit cancelled".into();
+            }
+            KeyCode::Enter => {
+                let Some(row) = app.selected_row() else {
+                    return TuiAction::Continue;
+                };
+                match parse_write_value(app.edit_value.trim()) {
+                    Ok(value) => {
+                        return TuiAction::Write(WriteRequest {
+                            name: row.name.clone(),
+                            value,
+                            mav_type: row.mav_type,
+                            source: "TUI edit".into(),
+                        });
+                    }
+                    Err(err) => app.status_message = format!("Invalid value: {err:#}"),
+                }
+            }
+            KeyCode::Backspace => {
+                app.edit_value.pop();
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.edit_value.clear();
+            }
+            KeyCode::Char(c) => {
+                app.edit_value.push(c);
+            }
+            _ => {}
+        }
+        return TuiAction::Continue;
     }
 
     match key.code {
-        KeyCode::Char('q') => true,
+        KeyCode::Char('q') => TuiAction::Quit,
         KeyCode::Char('/') => {
-            app.search_mode = true;
-            false
+            app.mode = TuiMode::Search;
+            TuiAction::Continue
+        }
+        KeyCode::Enter | KeyCode::Char('e') => {
+            app.start_edit();
+            TuiAction::Continue
         }
         KeyCode::Char('g') => {
             app.selected = 0;
-            false
+            TuiAction::Continue
         }
         KeyCode::Char('G') => {
             if !app.filtered.is_empty() {
                 app.selected = app.filtered.len() - 1;
             }
-            false
+            TuiAction::Continue
         }
         KeyCode::Down | KeyCode::Char('j') => {
             app.move_down(1);
-            false
+            TuiAction::Continue
         }
         KeyCode::Up | KeyCode::Char('k') => {
             app.move_up(1);
-            false
+            TuiAction::Continue
         }
         KeyCode::PageDown => {
             app.move_down(20);
-            false
+            TuiAction::Continue
         }
         KeyCode::PageUp => {
             app.move_up(20);
-            false
+            TuiAction::Continue
         }
         KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.move_down(20);
-            false
+            TuiAction::Continue
         }
         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.move_up(20);
-            false
+            TuiAction::Continue
         }
         KeyCode::Esc => {
             app.query.clear();
             app.apply_filter();
-            false
+            TuiAction::Continue
         }
-        _ => false,
+        _ => TuiAction::Continue,
     }
 }
 
@@ -1094,20 +1215,24 @@ fn draw_tui(frame: &mut ratatui::Frame, app: &TuiApp) {
         ])
         .split(frame.area());
 
-    let search_title = if app.search_mode {
-        "Search (Enter done, Esc clear)"
-    } else {
-        "Search (/ to edit, Esc clear)"
+    let input_title = match app.mode {
+        TuiMode::Browse => "Search (/), Edit selected value (e/Enter)",
+        TuiMode::Search => "Search (Enter done, Esc clear)",
+        TuiMode::Edit => "Edit value (Enter writes, Esc cancels)",
     };
-    let search_style = if app.search_mode {
-        Style::default().yellow()
-    } else {
-        Style::default()
+    let input_style = match app.mode {
+        TuiMode::Search => Style::default().yellow(),
+        TuiMode::Edit => Style::default().cyan(),
+        TuiMode::Browse => Style::default(),
     };
-    let search = Paragraph::new(app.query.as_str())
-        .block(Block::default().borders(Borders::ALL).title(search_title))
-        .style(search_style);
-    frame.render_widget(search, chunks[0]);
+    let input_value = match app.mode {
+        TuiMode::Edit => app.edit_value.as_str(),
+        _ => app.query.as_str(),
+    };
+    let input = Paragraph::new(input_value)
+        .block(Block::default().borders(Borders::ALL).title(input_title))
+        .style(input_style);
+    frame.render_widget(input, chunks[0]);
 
     let rows = app.filtered.iter().filter_map(|index| {
         let row = app.rows.get(*index)?;
@@ -1160,12 +1285,14 @@ fn draw_tui(frame: &mut ratatui::Frame, app: &TuiApp) {
                     Span::raw("  "),
                     Span::styled(row.status.as_str(), status_style(&row.status)),
                 ]),
-                Line::from("Keys: q quit | / search | arrows/j/k scroll | PgUp/PgDn or Ctrl-u/Ctrl-d | g/G top/bottom"),
+                Line::from(app.status_message.as_str()),
+                Line::from("Keys: q quit | e/Enter edit | / search | arrows/j/k scroll | PgUp/PgDn | g/G top/bottom"),
             ]
         })
         .unwrap_or_else(|| {
             vec![
                 Line::from("No matching parameters"),
+                Line::from(app.status_message.as_str()),
                 Line::from("Keys: q quit | / search | Esc clear search"),
             ]
         });
