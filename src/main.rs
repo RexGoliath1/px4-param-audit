@@ -15,7 +15,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell as TuiCell, Paragraph, Row, Table, TableState};
 use serde_yaml::Value;
-use serialport::SerialPort;
+use serialport::{SerialPort, SerialPortInfo, SerialPortType, UsbPortInfo};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, ErrorKind, IsTerminal, Read, Write};
@@ -68,6 +68,10 @@ struct Args {
     /// Seconds to wait for each write confirmation from PX4.
     #[arg(long, default_value_t = 3)]
     write_timeout: u64,
+
+    /// List detected serial ports and exit.
+    #[arg(long)]
+    list_ports: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -111,7 +115,15 @@ struct VehicleIdentity {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let connect = args.connect.clone().unwrap_or_else(default_connection);
+    if args.list_ports {
+        print_serial_ports()?;
+        return Ok(());
+    }
+
+    let connect = match args.connect.clone() {
+        Some(connect) => connect,
+        None => default_connection()?,
+    };
 
     println!("connecting: {connect}");
     let mut conn =
@@ -176,13 +188,136 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn default_connection() -> String {
-    for port in ["/dev/cu.usbmodem01", "/dev/tty.usbmodem01"] {
-        if Path::new(port).exists() {
-            return format!("serial:{port}:57600");
+const DEFAULT_BAUD: u32 = 57600;
+
+fn default_connection() -> Result<String> {
+    if let Some(port) = discover_px4_serial_port()? {
+        return Ok(format!("serial:{port}:{DEFAULT_BAUD}"));
+    }
+
+    for port in fallback_serial_paths() {
+        if Path::new(&port).exists() {
+            return Ok(format!("serial:{port}:{DEFAULT_BAUD}"));
         }
     }
-    "serial:/dev/cu.usbmodem01:57600".to_string()
+
+    bail!("could not autodiscover a PX4 USB serial port; pass --connect or run --list-ports")
+}
+
+fn discover_px4_serial_port() -> Result<Option<String>> {
+    let mut candidates = serialport::available_ports()
+        .context("failed to list serial ports")?
+        .into_iter()
+        .filter_map(|port| {
+            let score = score_serial_port(&port);
+            (score > 0).then_some((score, port.port_name))
+        })
+        .collect::<Vec<_>>();
+
+    candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    Ok(candidates.into_iter().next().map(|(_, port)| port))
+}
+
+fn score_serial_port(port: &SerialPortInfo) -> i32 {
+    let mut score = score_port_name(&port.port_name);
+    if let SerialPortType::UsbPort(usb) = &port.port_type {
+        score += score_usb_info(usb);
+    }
+    score
+}
+
+fn score_usb_info(usb: &UsbPortInfo) -> i32 {
+    let mut score = 0;
+    let text = format!(
+        "{} {}",
+        usb.manufacturer.as_deref().unwrap_or_default(),
+        usb.product.as_deref().unwrap_or_default()
+    )
+    .to_lowercase();
+
+    if usb.vid == 12677 {
+        score += 800;
+    }
+    if text.contains("px4")
+        || text.contains("pixhawk")
+        || text.contains("fmu")
+        || text.contains("auterion")
+        || text.contains("holybro")
+    {
+        score += 1000;
+    }
+    score
+}
+
+fn score_port_name(port_name: &str) -> i32 {
+    let name = port_name.to_lowercase();
+    let mut score = 0;
+    if name.contains("usbmodem") {
+        score += 300;
+    }
+    if name.contains("ttyacm") {
+        score += 250;
+    }
+    if name.contains("/dev/serial/by-id") {
+        score += 220;
+    }
+    if name.contains("ttyusb") || name.contains("usbserial") {
+        score += 100;
+    }
+    if score > 0 && name.contains("/dev/cu.") {
+        score += 20;
+    }
+    score
+}
+
+fn fallback_serial_paths() -> Vec<String> {
+    let mut paths = vec![
+        "/dev/cu.usbmodem01".to_string(),
+        "/dev/tty.usbmodem01".to_string(),
+        "/dev/ttyACM0".to_string(),
+        "/dev/ttyACM1".to_string(),
+        "/dev/ttyUSB0".to_string(),
+        "/dev/ttyUSB1".to_string(),
+    ];
+
+    if let Ok(entries) = fs::read_dir("/dev/serial/by-id") {
+        let mut by_id = entries
+            .flatten()
+            .map(|entry| entry.path().display().to_string())
+            .collect::<Vec<_>>();
+        by_id.sort();
+        paths.extend(by_id);
+    }
+
+    paths
+}
+
+fn print_serial_ports() -> Result<()> {
+    let ports = serialport::available_ports().context("failed to list serial ports")?;
+    if ports.is_empty() {
+        println!("no serial ports detected");
+        return Ok(());
+    }
+
+    for port in ports {
+        let score = score_serial_port(&port);
+        match port.port_type {
+            SerialPortType::UsbPort(usb) => {
+                println!(
+                    "{} score={} usb vid={:#06x} pid={:#06x} manufacturer={} product={} serial={}",
+                    port.port_name,
+                    score,
+                    usb.vid,
+                    usb.pid,
+                    usb.manufacturer.as_deref().unwrap_or("-"),
+                    usb.product.as_deref().unwrap_or("-"),
+                    usb.serial_number.as_deref().unwrap_or("-"),
+                );
+            }
+            other => println!("{} score={} {:?}", port.port_name, score, other),
+        }
+    }
+    Ok(())
 }
 
 struct MavSerial {

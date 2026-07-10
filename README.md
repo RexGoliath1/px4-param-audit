@@ -49,7 +49,27 @@ port open and the audit tool cannot connect while QGC owns it.
 px4-param-audit --connect serial:/dev/cu.usbmodem01:57600
 ```
 
-If `--connect` is omitted, the tool tries `/dev/cu.usbmodem01` first.
+If `--connect` is omitted, the tool autodiscovers a PX4/Pixhawk USB serial
+port and uses baud `57600`.
+
+On macOS this commonly resolves to:
+
+```text
+serial:/dev/cu.usbmodem01:57600
+```
+
+On Linux this commonly resolves to a `ttyACM` or `/dev/serial/by-id` device,
+for example:
+
+```text
+serial:/dev/ttyACM0:57600
+```
+
+List detected serial ports and their discovery scores:
+
+```bash
+px4-param-audit --list-ports
+```
 
 Use a specific PX4 source checkout for baseline defaults:
 
