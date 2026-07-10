@@ -88,6 +88,12 @@ struct Recommendation {
     source: String,
 }
 
+#[derive(Debug)]
+struct FirmwareDefaults {
+    defaults: HashMap<String, String>,
+    serial_config_params: HashSet<String>,
+}
+
 #[derive(Debug, Clone)]
 struct AuditRow {
     name: String,
@@ -155,8 +161,14 @@ fn main() -> Result<()> {
     } else {
         HashMap::new()
     };
+    let serial_port_indexes = load_serial_port_indexes(&px4_source)?;
 
-    let recommendations = build_recommendations(firmware_defaults, airframe_defaults);
+    let recommendations = build_recommendations(
+        firmware_defaults.defaults,
+        airframe_defaults,
+        &firmware_defaults.serial_config_params,
+        &serial_port_indexes,
+    );
     print_baseline(device_sys_autostart, args.sys_autostart, &px4_source)?;
     print_px4_source(&px4_source);
     let rows = build_audit_rows(&params, &recommendations);
@@ -1026,20 +1038,21 @@ fn format_hash(bytes: &[u8; 8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn load_firmware_defaults(
-    px4_source: &Path,
-    wanted: &HashSet<String>,
-) -> Result<HashMap<String, String>> {
+fn load_firmware_defaults(px4_source: &Path, wanted: &HashSet<String>) -> Result<FirmwareDefaults> {
     let mut defaults = HashMap::new();
+    let mut serial_config_params = HashSet::new();
     let src = px4_source.join("src");
     visit_yaml_files(&src, &mut |path| {
         if let Ok(text) = fs::read_to_string(path) {
             if let Ok(yaml) = serde_yaml::from_str::<Value>(&text) {
-                collect_yaml_defaults(&yaml, wanted, &mut defaults);
+                collect_yaml_defaults(&yaml, wanted, &mut defaults, &mut serial_config_params);
             }
         }
     })?;
-    Ok(defaults)
+    Ok(FirmwareDefaults {
+        defaults,
+        serial_config_params,
+    })
 }
 
 fn visit_yaml_files(dir: &Path, f: &mut dyn FnMut(&Path)) -> Result<()> {
@@ -1065,6 +1078,7 @@ fn collect_yaml_defaults(
     value: &Value,
     wanted: &HashSet<String>,
     defaults: &mut HashMap<String, String>,
+    serial_config_params: &mut HashSet<String>,
 ) {
     match value {
         Value::Mapping(map) => {
@@ -1090,19 +1104,22 @@ fn collect_yaml_defaults(
                     .get(Value::String("name".into()))
                     .and_then(Value::as_str);
                 let default = port_config.get(Value::String("default".into()));
-                if let (Some(name), Some(default)) = (name, default) {
+                if let Some(name) = name {
                     if wanted.contains(name) {
-                        defaults.insert(name.to_string(), yaml_scalar_to_string(default));
+                        serial_config_params.insert(name.to_string());
+                        if let Some(default) = default {
+                            defaults.insert(name.to_string(), yaml_scalar_to_string(default));
+                        }
                     }
                 }
             }
             for child in map.values() {
-                collect_yaml_defaults(child, wanted, defaults);
+                collect_yaml_defaults(child, wanted, defaults, serial_config_params);
             }
         }
         Value::Sequence(seq) => {
             for child in seq {
-                collect_yaml_defaults(child, wanted, defaults);
+                collect_yaml_defaults(child, wanted, defaults, serial_config_params);
             }
         }
         _ => {}
@@ -1199,30 +1216,116 @@ fn resolve_px4_init_source(px4_source: &Path, source: &str) -> Option<PathBuf> {
         .map(|relative| px4_source.join("ROMFS/px4fmu_common/init.d").join(relative))
 }
 
+fn load_serial_port_indexes(px4_source: &Path) -> Result<HashMap<String, String>> {
+    let path = px4_source.join("Tools/serial/generate_config.py");
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+    let text = fs::read_to_string(path)?;
+    Ok(parse_serial_port_indexes(&text))
+}
+
+fn parse_serial_port_indexes(text: &str) -> HashMap<String, String> {
+    let mut indexes = HashMap::new();
+    let mut current_tag: Option<String> = None;
+
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+
+        if let Some((tag, _)) = line
+            .strip_prefix('"')
+            .and_then(|rest| rest.split_once('"'))
+            .filter(|(_, rest)| {
+                rest.trim_start()
+                    .strip_prefix(':')
+                    .is_some_and(|rest| rest.trim_start().starts_with('{'))
+            })
+        {
+            current_tag = Some(tag.to_string());
+            continue;
+        }
+
+        let Some(tag) = current_tag.as_ref() else {
+            continue;
+        };
+        let Some(raw_index) = line
+            .strip_prefix("\"index\"")
+            .and_then(|rest| rest.trim_start().strip_prefix(':'))
+        else {
+            continue;
+        };
+        let index = raw_index
+            .split(',')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_matches('\'')
+            .trim_matches('"');
+        if !index.is_empty() && index.chars().all(|c| c.is_ascii_digit()) {
+            indexes.insert(tag.clone(), index.to_string());
+        }
+    }
+
+    indexes
+}
+
 fn build_recommendations(
     firmware: HashMap<String, String>,
     airframe: HashMap<String, String>,
+    serial_config_params: &HashSet<String>,
+    serial_port_indexes: &HashMap<String, String>,
 ) -> HashMap<String, Recommendation> {
     let mut out = HashMap::new();
     for (name, value) in firmware {
+        let (value, label) =
+            normalize_default_value(&name, value, serial_config_params, serial_port_indexes);
         out.insert(
             name,
             Recommendation {
                 value,
-                source: "firmware default".into(),
+                source: recommendation_source("firmware default", label.as_deref()),
             },
         );
     }
     for (name, value) in airframe {
+        let (value, label) =
+            normalize_default_value(&name, value, serial_config_params, serial_port_indexes);
         out.insert(
             name,
             Recommendation {
                 value,
-                source: "airframe default".into(),
+                source: recommendation_source("airframe default", label.as_deref()),
             },
         );
     }
     out
+}
+
+fn normalize_default_value(
+    name: &str,
+    value: String,
+    serial_config_params: &HashSet<String>,
+    serial_port_indexes: &HashMap<String, String>,
+) -> (String, Option<String>) {
+    if !serial_config_params.contains(name) {
+        return (value, None);
+    }
+
+    let trimmed = value.trim();
+    match serial_port_indexes.get(trimmed) {
+        Some(index) => (index.clone(), Some(trimmed.to_string())),
+        None => (value, None),
+    }
+}
+
+fn recommendation_source(base: &str, label: Option<&str>) -> String {
+    match label {
+        Some(label) => format!("{base} ({label})"),
+        None => base.into(),
+    }
 }
 
 fn build_audit_rows(
@@ -1283,6 +1386,7 @@ struct TuiApp {
     filtered: Vec<usize>,
     query: String,
     edit_value: String,
+    pending_writes: Vec<WriteRequest>,
     mode: TuiMode,
     selected: usize,
     status_message: String,
@@ -1293,12 +1397,14 @@ enum TuiMode {
     Browse,
     Search,
     Edit,
+    ConfirmDefaults,
 }
 
 enum TuiAction {
     Continue,
     Quit,
     Write(WriteRequest),
+    WriteMany(Vec<WriteRequest>),
 }
 
 impl TuiApp {
@@ -1309,9 +1415,10 @@ impl TuiApp {
             filtered,
             query: String::new(),
             edit_value: String::new(),
+            pending_writes: Vec::new(),
             mode: TuiMode::Browse,
             selected: 0,
-            status_message: "Browse: e/Enter edit selected value, / search, q quit".into(),
+            status_message: "Browse: e/Enter edit, d default selected, A default all".into(),
         }
     }
 
@@ -1386,6 +1493,74 @@ impl TuiApp {
         }
         self.apply_filter();
     }
+
+    fn update_value_by_name(&mut self, name: &str, confirmed: ParamValue) {
+        if let Some(row) = self.rows.iter_mut().find(|row| row.name == name) {
+            row.current = format_param(&confirmed);
+            row.mav_type = confirmed.mav_type;
+            row.status = classify_status(&row.current, &row.baseline);
+        }
+        self.apply_filter();
+    }
+
+    fn selected_default_write(&mut self) -> Option<WriteRequest> {
+        let Some(row) = self.selected_row() else {
+            return None;
+        };
+        let name = row.name.clone();
+        let baseline = row.baseline.clone();
+        let mav_type = row.mav_type;
+        let source = row.source.clone();
+        let current = row.current.clone();
+
+        if values_equivalent(&current, &baseline) {
+            self.status_message = format!("{name} already matches PX4 baseline");
+            return None;
+        }
+
+        match parse_write_value(&baseline) {
+            Ok(value) => Some(WriteRequest {
+                name,
+                value,
+                mav_type,
+                source: format!("TUI default selected ({source})"),
+            }),
+            Err(_) => {
+                self.status_message = format!("No single numeric PX4 baseline for {name}");
+                None
+            }
+        }
+    }
+
+    fn default_diff_writes(&self) -> Vec<WriteRequest> {
+        self.rows
+            .iter()
+            .filter(|row| row.status == "diff")
+            .filter_map(|row| {
+                let value = parse_write_value(&row.baseline).ok()?;
+                Some(WriteRequest {
+                    name: row.name.clone(),
+                    value,
+                    mav_type: row.mav_type,
+                    source: format!("TUI default all ({})", row.source),
+                })
+            })
+            .collect()
+    }
+
+    fn start_default_all_confirmation(&mut self) {
+        self.pending_writes = self.default_diff_writes();
+        if self.pending_writes.is_empty() {
+            self.status_message =
+                "No numeric non-default values have a known PX4 baseline to write".into();
+            return;
+        }
+        self.mode = TuiMode::ConfirmDefaults;
+        self.status_message = format!(
+            "WARNING: reset {} numeric non-default value(s) on the device? y=yes n=no",
+            self.pending_writes.len()
+        );
+    }
 }
 
 fn run_tui(
@@ -1450,12 +1625,63 @@ fn run_tui_loop(
                     }
                 }
             }
+            TuiAction::WriteMany(writes) => {
+                let total = writes.len();
+                let mut written = 0usize;
+                app.mode = TuiMode::Browse;
+                app.pending_writes.clear();
+                for write in writes {
+                    app.status_message = format!(
+                        "Writing {}/{}: {} = {}...",
+                        written + 1,
+                        total,
+                        write.name,
+                        write.value
+                    );
+                    terminal.draw(|frame| draw_tui(frame, &app))?;
+                    match send_param_set(conn, identity, &write).and_then(|_| {
+                        wait_for_param_confirmation(conn, &write.name, write_timeout)
+                            .with_context(|| format!("PX4 did not confirm {}", write.name))
+                    }) {
+                        Ok(confirmed) => {
+                            written += 1;
+                            app.update_value_by_name(&write.name, confirmed);
+                        }
+                        Err(err) => {
+                            app.status_message = format!(
+                                "Stopped after {written}/{total} writes. {} failed: {err:#}",
+                                write.name
+                            );
+                            break;
+                        }
+                    }
+                }
+                if written == total {
+                    app.status_message = format!("Reset {written} parameter(s) to PX4 baseline");
+                }
+            }
         }
     }
     Ok(())
 }
 
 fn handle_key(app: &mut TuiApp, key: KeyEvent) -> TuiAction {
+    if app.mode == TuiMode::ConfirmDefaults {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                let writes = app.pending_writes.clone();
+                return TuiAction::WriteMany(writes);
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                app.pending_writes.clear();
+                app.mode = TuiMode::Browse;
+                app.status_message = "Default-all write cancelled".into();
+            }
+            _ => {}
+        }
+        return TuiAction::Continue;
+    }
+
     if app.mode == TuiMode::Search {
         match key.code {
             KeyCode::Esc => {
@@ -1528,6 +1754,14 @@ fn handle_key(app: &mut TuiApp, key: KeyEvent) -> TuiAction {
             app.start_edit();
             TuiAction::Continue
         }
+        KeyCode::Char('d') if key.modifiers.is_empty() => match app.selected_default_write() {
+            Some(write) => TuiAction::Write(write),
+            None => TuiAction::Continue,
+        },
+        KeyCode::Char('A') if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT => {
+            app.start_default_all_confirmation();
+            TuiAction::Continue
+        }
         KeyCode::Char('g') => {
             app.selected = 0;
             TuiAction::Continue
@@ -1577,22 +1811,27 @@ fn draw_tui(frame: &mut ratatui::Frame, app: &TuiApp) {
         .constraints([
             Constraint::Length(3),
             Constraint::Min(6),
-            Constraint::Length(4),
+            Constraint::Length(5),
         ])
         .split(frame.area());
 
     let input_title = match app.mode {
-        TuiMode::Browse => "Search (/), Edit selected value (e/Enter)",
+        TuiMode::Browse => "Search (/), Edit (e/Enter), Default selected (d), Default all (A)",
         TuiMode::Search => "Search (Enter done, Esc clear)",
         TuiMode::Edit => "Edit value (Enter writes, Esc cancels)",
+        TuiMode::ConfirmDefaults => "Reset all numeric diffs to PX4 baseline? y/n",
     };
     let input_style = match app.mode {
         TuiMode::Search => Style::default().yellow(),
         TuiMode::Edit => Style::default().cyan(),
+        TuiMode::ConfirmDefaults => Style::default().red().bold(),
         TuiMode::Browse => Style::default(),
     };
     let input_value = match app.mode {
         TuiMode::Edit => app.edit_value.as_str(),
+        TuiMode::ConfirmDefaults => {
+            "WARNING: all numeric non-default values will be reset on the device"
+        }
         _ => app.query.as_str(),
     };
     let input = Paragraph::new(input_value)
@@ -1652,7 +1891,7 @@ fn draw_tui(frame: &mut ratatui::Frame, app: &TuiApp) {
                     Span::styled(row.status.as_str(), status_style(&row.status)),
                 ]),
                 Line::from(app.status_message.as_str()),
-                Line::from("Keys: q quit | e/Enter edit | / search | arrows/j/k scroll | PgUp/PgDn | g/G top/bottom"),
+                Line::from("Keys: q quit | e/Enter edit | d default selected | A default all | / search | arrows/j/k scroll"),
             ]
         })
         .unwrap_or_else(|| {
@@ -1710,5 +1949,56 @@ fn values_equivalent(a: &str, b: &str) -> bool {
         (af - bf).abs() < 0.0001
     } else {
         a == b
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_px4_serial_port_indexes() {
+        let text = r#"
+serial_ports = {
+    "TEL1": {
+        "label": "TELEM 1",
+        "index": 101,
+        },
+    "GPS1": {
+        "label": "GPS 1",
+        "index": 201,
+        },
+}
+"#;
+
+        let indexes = parse_serial_port_indexes(text);
+
+        assert_eq!(indexes.get("TEL1").map(String::as_str), Some("101"));
+        assert_eq!(indexes.get("GPS1").map(String::as_str), Some("201"));
+    }
+
+    #[test]
+    fn normalizes_serial_label_defaults_only_for_serial_config_params() {
+        let serial_config_params = HashSet::from(["GPS_1_CONFIG".to_string()]);
+        let serial_port_indexes = HashMap::from([("GPS1".to_string(), "201".to_string())]);
+
+        assert_eq!(
+            normalize_default_value(
+                "GPS_1_CONFIG",
+                "GPS1".into(),
+                &serial_config_params,
+                &serial_port_indexes
+            ),
+            ("201".into(), Some("GPS1".into()))
+        );
+        assert_eq!(
+            normalize_default_value(
+                "SOME_OTHER_PARAM",
+                "GPS1".into(),
+                &serial_config_params,
+                &serial_port_indexes
+            ),
+            ("GPS1".into(), None)
+        );
     }
 }

@@ -133,13 +133,22 @@ cargo run -- --connect serial:/dev/cu.usbmodem01:57600 --sys-autostart 4019
 
 ## TUI Editing
 
-The TUI can edit device values directly:
+The TUI can edit or reset device values directly:
 
 - Select a parameter row.
 - Press `e` or `Enter`.
 - Type a numeric value.
 - Press `Enter` to write it with MAVLink `PARAM_SET`.
 - Press `Esc` to cancel editing.
+
+To reset one selected parameter to the PX4 baseline value, press `d`.
+
+To reset every numeric non-default value with a known PX4 baseline, press `A`.
+The TUI shows a warning prompt before writing. Press `y` to confirm or `n` /
+`Esc` to cancel. PX4 serial-port labels such as `GPS1` are resolved to their
+numeric MAVLink parameter values when PX4's serial metadata is available.
+Other string-like defaults are skipped because the tool only writes single
+numeric MAVLink parameter values.
 
 After PX4 confirms the write, the device value and status update in the table.
 
@@ -174,14 +183,17 @@ px4-param-audit \
 The tool prints the planned writes and prompts for `yes`. Add `--yes` only when
 you intentionally want non-interactive writes.
 
-String-like PX4 metadata defaults such as `GPS1` are not written by
-`--write-diffs`; use an explicit numeric `--set PARAM=VALUE` once the correct
-MAVLink parameter value is known.
+PX4 serial-port labels such as `GPS1` are resolved to their numeric MAVLink
+parameter values when PX4's serial metadata is available. Other string-like
+defaults are not written by `--write-diffs`; use an explicit numeric
+`--set PARAM=VALUE` once the correct MAVLink parameter value is known.
 
 ## TUI Keys
 
 - `q`: quit
 - `e` / `Enter`: edit selected device value
+- `d`: write the selected parameter's numeric PX4 baseline value
+- `A`: prompt, then write all numeric diffs back to PX4 baseline values
 - `/`: edit search
 - `Enter`: leave search mode
 - `Esc`: clear search or cancel editing
