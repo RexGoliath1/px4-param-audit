@@ -1,6 +1,6 @@
 # px4-param-audit
 
-Read-only PX4 parameter audit tool for multirotors.
+PX4 parameter audit and explicit write tool for multirotors.
 
 The first target is Pixhawk/Holybro over MAVLink serial. Starling/VOXL support is
 intentionally out of scope for the MVP.
@@ -15,8 +15,10 @@ intentionally out of scope for the MVP.
 - Parses matching airframe defaults from `SYS_AUTOSTART` or `--sys-autostart`.
 - Opens a scrollable/searchable terminal UI listing every parameter read from
   the device.
+- Can write explicit numeric parameter values when requested.
 
-The tool does not write parameters.
+Normal browse/audit mode does not write parameters. Writes only happen through
+write flags and require confirmation unless `--yes` is supplied.
 
 ## Build
 
@@ -84,6 +86,41 @@ You can also run through Cargo during development:
 cargo run -- --connect serial:/dev/cu.usbmodem01:57600 --sys-autostart 4019
 ```
 
+## Writes
+
+Write a single numeric parameter:
+
+```bash
+px4-param-audit \
+  --connect serial:/dev/cu.usbmodem01:57600 \
+  --set SYS_HAS_GPS=1
+```
+
+Write multiple explicit parameters:
+
+```bash
+px4-param-audit \
+  --connect serial:/dev/cu.usbmodem01:57600 \
+  --set SYS_HAS_GPS=1 \
+  --set EKF2_GPS_CTRL=7
+```
+
+Write all numeric diffs that have a known PX4 baseline:
+
+```bash
+px4-param-audit \
+  --connect serial:/dev/cu.usbmodem01:57600 \
+  --sys-autostart 4019 \
+  --write-diffs
+```
+
+The tool prints the planned writes and prompts for `yes`. Add `--yes` only when
+you intentionally want non-interactive writes.
+
+String-like PX4 metadata defaults such as `GPS1` are not written by
+`--write-diffs`; use an explicit numeric `--set PARAM=VALUE` once the correct
+MAVLink parameter value is known.
+
 ## TUI Keys
 
 - `q`: quit
@@ -97,17 +134,6 @@ cargo run -- --connect serial:/dev/cu.usbmodem01:57600 --sys-autostart 4019
 The table lists every parameter returned by PX4. Search matches parameter name,
 device value, PX4 baseline value, source, or status.
 
-## Protected Parameters
-
-Rangefinder/SF11-related params are marked as `diff protected` when they differ
-from the PX4 baseline:
-
-- `EKF2_HGT_REF`
-- `EKF2_RNG_CTRL`
-- `SENS_EN_SF1XX`
-- `SF1XX_MODE`
-- `SF1XX_ROT`
-
 ## Baseline Model
 
 The baseline is derived from PX4, not from a hand-written project profile:
@@ -118,8 +144,8 @@ PX4 firmware YAML defaults
 ```
 
 If `--sys-autostart` is supplied, that airframe ID is used for the comparison
-baseline instead of the device's reported `SYS_AUTOSTART`. This is still
-read-only and does not change the vehicle.
+baseline instead of the device's reported `SYS_AUTOSTART`. Supplying a baseline
+only changes comparison output; it does not write by itself.
 
 If a parameter default cannot be found in local PX4 source, the table reports
 `<unknown>` rather than guessing.

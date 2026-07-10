@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use clap::Parser;
 use comfy_table::{Cell, Color, Table as PlainTable};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
@@ -18,13 +18,16 @@ use serde_yaml::Value;
 use serialport::SerialPort;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{self, ErrorKind, IsTerminal, Read};
+use std::io::{self, ErrorKind, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
 #[derive(Parser, Debug)]
-#[command(version, about = "Read-only PX4 parameter audit for multirotors")]
+#[command(
+    version,
+    about = "PX4 parameter audit and explicit write tool for multirotors"
+)]
 struct Args {
     /// MAVLink connection string. Use `serial:/dev/cu.usbmodem01:57600` for Pixhawk USB.
     #[arg(short, long)]
@@ -49,6 +52,22 @@ struct Args {
     /// Print a static table instead of opening the interactive TUI.
     #[arg(long)]
     plain: bool,
+
+    /// Set one parameter to a numeric value, for example SYS_HAS_GPS=1. May be repeated.
+    #[arg(long = "set", value_name = "PARAM=VALUE")]
+    set_params: Vec<String>,
+
+    /// Write every numeric diff with a known PX4 baseline value.
+    #[arg(long)]
+    write_diffs: bool,
+
+    /// Skip interactive confirmation for writes.
+    #[arg(long)]
+    yes: bool,
+
+    /// Seconds to wait for each write confirmation from PX4.
+    #[arg(long, default_value_t = 3)]
+    write_timeout: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -70,6 +89,15 @@ struct AuditRow {
     baseline: String,
     source: String,
     status: String,
+    mav_type: common::MavParamType,
+}
+
+#[derive(Debug, Clone)]
+struct WriteRequest {
+    name: String,
+    value: f32,
+    mav_type: common::MavParamType,
+    source: String,
 }
 
 #[derive(Debug)]
@@ -81,17 +109,9 @@ struct VehicleIdentity {
     version: Option<common::AUTOPILOT_VERSION_DATA>,
 }
 
-const PROTECTED_PARAMS: &[&str] = &[
-    "SENS_EN_SF1XX",
-    "SF1XX_MODE",
-    "SF1XX_ROT",
-    "EKF2_RNG_CTRL",
-    "EKF2_HGT_REF",
-];
-
 fn main() -> Result<()> {
     let args = Args::parse();
-    let connect = args.connect.unwrap_or_else(default_connection);
+    let connect = args.connect.clone().unwrap_or_else(default_connection);
 
     println!("connecting: {connect}");
     let mut conn =
@@ -124,6 +144,19 @@ fn main() -> Result<()> {
     let recommendations = build_recommendations(firmware_defaults, airframe_defaults);
     print_baseline(device_sys_autostart, args.sys_autostart, &args.px4_source)?;
     let rows = build_audit_rows(&params, &recommendations);
+
+    if args.write_diffs || !args.set_params.is_empty() {
+        let writes = build_write_plan(&args, &params, &rows)?;
+        confirm_writes(&writes, args.yes)?;
+        apply_writes(
+            &mut conn,
+            &identity,
+            writes,
+            Duration::from_secs(args.write_timeout),
+        )?;
+        println!("writes complete");
+        return Ok(());
+    }
 
     if args.verbose {
         println!("\nPX4 source: {}", args.px4_source.display());
@@ -381,6 +414,163 @@ fn collect_params(conn: &mut MavSerial, timeout: Duration) -> Result<HashMap<Str
         bail!("timed out waiting for PARAM_VALUE messages");
     }
     Ok(params)
+}
+
+fn build_write_plan(
+    args: &Args,
+    params: &HashMap<String, ParamValue>,
+    rows: &[AuditRow],
+) -> Result<Vec<WriteRequest>> {
+    let mut writes: HashMap<String, WriteRequest> = HashMap::new();
+
+    if args.write_diffs {
+        for row in rows {
+            if row.status != "diff" {
+                continue;
+            }
+            let Ok(value) = parse_write_value(&row.baseline) else {
+                continue;
+            };
+            writes.insert(
+                row.name.clone(),
+                WriteRequest {
+                    name: row.name.clone(),
+                    value,
+                    mav_type: row.mav_type,
+                    source: format!("PX4 baseline ({})", row.source),
+                },
+            );
+        }
+    }
+
+    for spec in &args.set_params {
+        let (name, value) = parse_set_spec(spec)?;
+        let current = params.get(&name).with_context(|| {
+            format!("cannot set unknown parameter {name}; it was not reported by PX4")
+        })?;
+        writes.insert(
+            name.clone(),
+            WriteRequest {
+                name,
+                value,
+                mav_type: current.mav_type,
+                source: "--set".into(),
+            },
+        );
+    }
+
+    let mut writes: Vec<_> = writes.into_values().collect();
+    writes.sort_by(|a, b| a.name.cmp(&b.name));
+    ensure!(
+        !writes.is_empty(),
+        "no writable parameters selected; known diffs may have nonnumeric baselines"
+    );
+    Ok(writes)
+}
+
+fn parse_set_spec(spec: &str) -> Result<(String, f32)> {
+    let Some((name, value)) = spec.split_once('=') else {
+        bail!("--set must look like PARAM=VALUE");
+    };
+    let name = name.trim();
+    ensure!(!name.is_empty(), "--set parameter name cannot be empty");
+    ensure!(
+        name.len() <= 16,
+        "MAVLink parameter names are at most 16 bytes: {name}"
+    );
+    Ok((name.to_string(), parse_write_value(value.trim())?))
+}
+
+fn parse_write_value(value: &str) -> Result<f32> {
+    ensure!(
+        value != "<unknown>" && !value.contains(','),
+        "not a single numeric value: {value}"
+    );
+    Ok(value.parse::<f32>()?)
+}
+
+fn confirm_writes(writes: &[WriteRequest], yes: bool) -> Result<()> {
+    println!("planned writes:");
+    for write in writes {
+        println!(
+            "  {} = {} ({:?}, {})",
+            write.name, write.value, write.mav_type, write.source
+        );
+    }
+
+    if yes {
+        return Ok(());
+    }
+
+    ensure!(
+        io::stdin().is_terminal(),
+        "refusing to prompt on non-interactive stdin; pass --yes to confirm writes"
+    );
+
+    print!(
+        "write {} parameter(s) to PX4? Type 'yes' to continue: ",
+        writes.len()
+    );
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    ensure!(answer.trim() == "yes", "write cancelled");
+    Ok(())
+}
+
+fn apply_writes(
+    conn: &mut MavSerial,
+    identity: &VehicleIdentity,
+    writes: Vec<WriteRequest>,
+    timeout: Duration,
+) -> Result<()> {
+    for write in writes {
+        send_param_set(conn, identity, &write)?;
+        let confirmed = wait_for_param_confirmation(conn, &write.name, timeout)
+            .with_context(|| format!("PX4 did not confirm {}", write.name))?;
+        println!("set {} = {}", write.name, format_param(&confirmed));
+    }
+    Ok(())
+}
+
+fn send_param_set(
+    conn: &mut MavSerial,
+    identity: &VehicleIdentity,
+    write: &WriteRequest,
+) -> Result<()> {
+    let msg = common::MavMessage::PARAM_SET(common::PARAM_SET_DATA {
+        target_system: identity.system_id,
+        target_component: identity.component_id,
+        param_id: write.name.as_str().into(),
+        param_value: write.value,
+        param_type: write.mav_type,
+    });
+    conn.send(&msg)?;
+    Ok(())
+}
+
+fn wait_for_param_confirmation(
+    conn: &mut MavSerial,
+    name: &str,
+    timeout: Duration,
+) -> Result<ParamValue> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        match conn.recv() {
+            Some((_, common::MavMessage::PARAM_VALUE(param))) => {
+                let param_name = param.param_id.to_str().unwrap_or("");
+                if param_name == name {
+                    return Ok(ParamValue {
+                        value: param.param_value,
+                        mav_type: param.param_type,
+                    });
+                }
+            }
+            Some(_) => {}
+            None => thread::sleep(Duration::from_millis(5)),
+        }
+    }
+    bail!("timed out waiting for PARAM_VALUE");
 }
 
 fn print_identity(identity: &VehicleIdentity) {
@@ -668,7 +858,6 @@ fn build_audit_rows(
     params: &HashMap<String, ParamValue>,
     recommendations: &HashMap<String, Recommendation>,
 ) -> Vec<AuditRow> {
-    let protected: HashSet<&str> = PROTECTED_PARAMS.iter().copied().collect();
     let mut rows: Vec<AuditRow> = params
         .iter()
         .map(|(name, value)| {
@@ -680,14 +869,14 @@ fn build_audit_rows(
             let source = rec
                 .map(|r| r.source.clone())
                 .unwrap_or_else(|| "not found".into());
-            let status =
-                classify_status(name, &current, &baseline, protected.contains(name.as_str()));
+            let status = classify_status(&current, &baseline);
             AuditRow {
                 name: name.clone(),
                 current,
                 baseline,
                 source,
                 status,
+                mav_type: value.mav_type,
             }
         })
         .collect();
@@ -703,7 +892,6 @@ fn print_audit_table(rows: &[AuditRow]) {
         let color = match row.status.as_str() {
             "match" => Color::Green,
             "diff" => Color::Red,
-            "diff protected" => Color::Yellow,
             "unknown" => Color::DarkGrey,
             _ => Color::White,
         };
@@ -992,7 +1180,6 @@ fn status_style(status: &str) -> Style {
     match status {
         "match" => Style::default().green(),
         "diff" => Style::default().red(),
-        "diff protected" => Style::default().yellow(),
         "unknown" => Style::default().dark_gray(),
         _ => Style::default(),
     }
@@ -1013,21 +1200,15 @@ fn format_param(param: &ParamValue) -> String {
     }
 }
 
-fn classify_status(name: &str, current: &str, baseline: &str, protected: bool) -> String {
+fn classify_status(current: &str, baseline: &str) -> String {
     if baseline == "<unknown>" || current == "<missing>" {
         return "unknown".into();
     }
     let matches = values_equivalent(current, baseline);
-    match (matches, protected) {
-        (true, _) => "match".into(),
-        (false, true) => "diff protected".into(),
-        (false, false) => {
-            if name.starts_with("GPS") || name.contains("GPS") {
-                "diff".into()
-            } else {
-                "diff".into()
-            }
-        }
+    if matches {
+        "match".into()
+    } else {
+        "diff".into()
     }
 }
 
