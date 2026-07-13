@@ -138,6 +138,56 @@ Use `udp-listen` when the drone or MAVLink router is configured to send
 MAVLink to this computer. Use `udp-connect`/`udp` or `tcp` when this tool should
 initiate traffic to a known endpoint.
 
+## Starling / VOXL UDP
+
+Starling 2 normally appears over USB as a VOXL/ADB device, not as a Pixhawk
+MAVLink serial port on the host computer. In that setup, use UDP from
+`voxl-mavlink-server`.
+
+Confirm ADB can see the VOXL:
+
+```bash
+adb devices -l
+```
+
+Check whether `voxl-mavlink-server` is running:
+
+```bash
+adb shell 'voxl-inspect-services | grep voxl-mavlink-server'
+```
+
+Find the GCS IPs and MAVLink UDP ports configured on the VOXL:
+
+```bash
+adb shell 'cat /etc/modalai/voxl-mavlink-server.conf'
+adb shell 'ss -lunpt | grep -E "14550|1455"'
+```
+
+In `voxl-mavlink-server.conf`, `primary_static_gcs_ip` and
+`secondary_static_gcs_ip` are the host IPs that VOXL will send GCS MAVLink to.
+`gcs_port_from_autopilot` is the VOXL-side receive path from PX4; the host
+usually listens on the GCS UDP port shown by `ss`, commonly `14550`.
+
+Find the PX4 airframe ID for baseline comparison:
+
+```bash
+adb shell 'px4-param show SYS_AUTOSTART'
+```
+
+Then run the tool on the host. For example, if VOXL sends GCS MAVLink to this
+computer on UDP `14550` and `SYS_AUTOSTART=4001`:
+
+```bash
+./px4-param-audit \
+  --connect udp-listen:0.0.0.0:14550 \
+  --sys-autostart 4001 \
+  --param-timeout 45
+```
+
+If QGroundControl or another process is already bound to `14550`, configure a
+second VOXL GCS endpoint or use a MAVLink router/proxy so each program has its
+own local UDP port.
+
 If `--connect` is omitted, the tool autodiscovers a PX4/Pixhawk USB serial
 port and uses baud `57600`.
 
