@@ -91,7 +91,27 @@ struct Recommendation {
 #[derive(Debug)]
 struct FirmwareDefaults {
     defaults: HashMap<String, String>,
+    metadata: HashMap<String, ParamMetadata>,
     serial_config_params: HashSet<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ParamMetadata {
+    param_type: Option<String>,
+    short_description: Option<String>,
+    unit: Option<String>,
+    min: Option<String>,
+    max: Option<String>,
+    decimal: Option<String>,
+    reboot_required: bool,
+    values: Vec<ParamChoice>,
+    bits: Vec<ParamChoice>,
+}
+
+#[derive(Debug, Clone)]
+struct ParamChoice {
+    value: i64,
+    label: String,
 }
 
 #[derive(Debug, Clone)]
@@ -102,6 +122,7 @@ struct AuditRow {
     source: String,
     status: String,
     mav_type: common::MavParamType,
+    metadata: Option<ParamMetadata>,
 }
 
 #[derive(Debug, Clone)]
@@ -164,14 +185,14 @@ fn main() -> Result<()> {
     let serial_port_indexes = load_serial_port_indexes(&px4_source)?;
 
     let recommendations = build_recommendations(
-        firmware_defaults.defaults,
+        firmware_defaults.defaults.clone(),
         airframe_defaults,
         &firmware_defaults.serial_config_params,
         &serial_port_indexes,
     );
     print_baseline(device_sys_autostart, args.sys_autostart, &px4_source)?;
     print_px4_source(&px4_source);
-    let rows = build_audit_rows(&params, &recommendations);
+    let rows = build_audit_rows(&params, &recommendations, &firmware_defaults.metadata);
 
     if args.write_diffs || !args.set_params.is_empty() {
         let writes = build_write_plan(&args, &params, &rows)?;
@@ -1042,17 +1063,25 @@ fn format_hash(bytes: &[u8; 8]) -> String {
 
 fn load_firmware_defaults(px4_source: &Path, wanted: &HashSet<String>) -> Result<FirmwareDefaults> {
     let mut defaults = HashMap::new();
+    let mut metadata = HashMap::new();
     let mut serial_config_params = HashSet::new();
     let src = px4_source.join("src");
     visit_yaml_files(&src, &mut |path| {
         if let Ok(text) = fs::read_to_string(path) {
             if let Ok(yaml) = serde_yaml::from_str::<Value>(&text) {
-                collect_yaml_defaults(&yaml, wanted, &mut defaults, &mut serial_config_params);
+                collect_yaml_param_data(
+                    &yaml,
+                    wanted,
+                    &mut defaults,
+                    &mut metadata,
+                    &mut serial_config_params,
+                );
             }
         }
     })?;
     Ok(FirmwareDefaults {
         defaults,
+        metadata,
         serial_config_params,
     })
 }
@@ -1076,10 +1105,11 @@ fn visit_yaml_files(dir: &Path, f: &mut dyn FnMut(&Path)) -> Result<()> {
     Ok(())
 }
 
-fn collect_yaml_defaults(
+fn collect_yaml_param_data(
     value: &Value,
     wanted: &HashSet<String>,
     defaults: &mut HashMap<String, String>,
+    metadata: &mut HashMap<String, ParamMetadata>,
     serial_config_params: &mut HashSet<String>,
 ) {
     match value {
@@ -1089,11 +1119,12 @@ fn collect_yaml_defaults(
                 for (key, body) in definitions {
                     if let Some(name) = key.as_str() {
                         if wanted.contains(name) {
-                            if let Some(default) = body
-                                .as_mapping()
-                                .and_then(|m| m.get(Value::String("default".into())))
-                            {
-                                defaults.insert(name.to_string(), yaml_scalar_to_string(default));
+                            if let Some(body) = body.as_mapping() {
+                                if let Some(default) = body.get(Value::String("default".into())) {
+                                    defaults
+                                        .insert(name.to_string(), yaml_scalar_to_string(default));
+                                }
+                                metadata.insert(name.to_string(), parse_param_metadata(body));
                             }
                         }
                     }
@@ -1116,15 +1147,70 @@ fn collect_yaml_defaults(
                 }
             }
             for child in map.values() {
-                collect_yaml_defaults(child, wanted, defaults, serial_config_params);
+                collect_yaml_param_data(child, wanted, defaults, metadata, serial_config_params);
             }
         }
         Value::Sequence(seq) => {
             for child in seq {
-                collect_yaml_defaults(child, wanted, defaults, serial_config_params);
+                collect_yaml_param_data(child, wanted, defaults, metadata, serial_config_params);
             }
         }
         _ => {}
+    }
+}
+
+fn parse_param_metadata(body: &serde_yaml::Mapping) -> ParamMetadata {
+    let mut metadata = ParamMetadata {
+        param_type: yaml_field_string(body, "type"),
+        short_description: body
+            .get(Value::String("description".into()))
+            .and_then(Value::as_mapping)
+            .and_then(|description| yaml_field_string(description, "short")),
+        unit: yaml_field_string(body, "unit"),
+        min: yaml_field_string(body, "min"),
+        max: yaml_field_string(body, "max"),
+        decimal: yaml_field_string(body, "decimal"),
+        reboot_required: body
+            .get(Value::String("reboot_required".into()))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        values: parse_param_choices(body.get(Value::String("values".into()))),
+        bits: parse_param_choices(
+            body.get(Value::String("bit".into()))
+                .or_else(|| body.get(Value::String("bitmask".into()))),
+        ),
+    };
+    metadata.values.sort_by_key(|choice| choice.value);
+    metadata.bits.sort_by_key(|choice| choice.value);
+    metadata
+}
+
+fn yaml_field_string(map: &serde_yaml::Mapping, key: &str) -> Option<String> {
+    map.get(Value::String(key.into()))
+        .map(yaml_scalar_to_string)
+}
+
+fn parse_param_choices(value: Option<&Value>) -> Vec<ParamChoice> {
+    let Some(Value::Mapping(map)) = value else {
+        return Vec::new();
+    };
+
+    map.iter()
+        .filter_map(|(key, label)| {
+            let value = yaml_key_to_i64(key)?;
+            Some(ParamChoice {
+                value,
+                label: yaml_scalar_to_string(label),
+            })
+        })
+        .collect()
+}
+
+fn yaml_key_to_i64(value: &Value) -> Option<i64> {
+    match value {
+        Value::Number(number) => number.as_i64(),
+        Value::String(s) => s.parse().ok(),
+        _ => None,
     }
 }
 
@@ -1333,6 +1419,7 @@ fn recommendation_source(base: &str, label: Option<&str>) -> String {
 fn build_audit_rows(
     params: &HashMap<String, ParamValue>,
     recommendations: &HashMap<String, Recommendation>,
+    metadata: &HashMap<String, ParamMetadata>,
 ) -> Vec<AuditRow> {
     let mut rows: Vec<AuditRow> = params
         .iter()
@@ -1353,6 +1440,7 @@ fn build_audit_rows(
                 source,
                 status,
                 mav_type: value.mav_type,
+                metadata: metadata.get(name).cloned(),
             }
         })
         .collect();
@@ -1813,7 +1901,7 @@ fn draw_tui(frame: &mut ratatui::Frame, app: &TuiApp) {
         .constraints([
             Constraint::Length(3),
             Constraint::Min(6),
-            Constraint::Length(5),
+            Constraint::Length(8),
         ])
         .split(frame.area());
 
@@ -1884,18 +1972,7 @@ fn draw_tui(frame: &mut ratatui::Frame, app: &TuiApp) {
 
     let detail = app
         .selected_row()
-        .map(|row| {
-            vec![
-                Line::from(vec![
-                    Span::styled("Selected: ", Style::default().bold()),
-                    Span::raw(row.name.as_str()),
-                    Span::raw("  "),
-                    Span::styled(row.status.as_str(), status_style(&row.status)),
-                ]),
-                Line::from(app.status_message.as_str()),
-                Line::from("Keys: q quit | e/Enter edit | d default selected | A default all | / search | arrows/j/k scroll"),
-            ]
-        })
+        .map(|row| selected_detail_lines(row, &app.status_message))
         .unwrap_or_else(|| {
             vec![
                 Line::from("No matching parameters"),
@@ -1908,6 +1985,149 @@ fn draw_tui(frame: &mut ratatui::Frame, app: &TuiApp) {
         Paragraph::new(detail).block(Block::default().borders(Borders::ALL).title("Status")),
         chunks[2],
     );
+}
+
+fn selected_detail_lines(row: &AuditRow, status_message: &str) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(vec![
+        Span::styled("Selected: ", Style::default().bold()),
+        Span::raw(row.name.clone()),
+        Span::raw("  "),
+        Span::styled(row.status.clone(), status_style(&row.status)),
+    ])];
+
+    if let Some(metadata) = &row.metadata {
+        if let Some(line) = metadata_summary_line(metadata) {
+            lines.push(Line::from(line));
+        }
+        if let Some(line) = metadata_current_line(row, metadata) {
+            lines.push(Line::from(line));
+        }
+        if let Some(line) = metadata_choices_line(metadata) {
+            lines.push(Line::from(line));
+        }
+        if let Some(description) = &metadata.short_description {
+            lines.push(Line::from(format!(
+                "Description: {}",
+                compact_line(description, 150)
+            )));
+        }
+    }
+
+    lines.push(Line::from(status_message.to_string()));
+    lines.push(Line::from(
+        "Keys: q quit | e/Enter edit | d default selected | A default all | / search | arrows/j/k scroll",
+    ));
+    lines
+}
+
+fn metadata_summary_line(metadata: &ParamMetadata) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(param_type) = &metadata.param_type {
+        parts.push(param_type.clone());
+    }
+    match (&metadata.min, &metadata.max) {
+        (Some(min), Some(max)) => parts.push(format!("range {min}..{max}")),
+        (Some(min), None) => parts.push(format!("min {min}")),
+        (None, Some(max)) => parts.push(format!("max {max}")),
+        (None, None) => {}
+    }
+    if let Some(unit) = &metadata.unit {
+        parts.push(format!("unit {unit}"));
+    }
+    if let Some(decimal) = &metadata.decimal {
+        parts.push(format!("decimal {decimal}"));
+    }
+    if metadata.reboot_required {
+        parts.push("reboot required".into());
+    }
+
+    (!parts.is_empty()).then(|| format!("PX4 metadata: {}", parts.join(" | ")))
+}
+
+fn metadata_current_line(row: &AuditRow, metadata: &ParamMetadata) -> Option<String> {
+    if !metadata.bits.is_empty() {
+        let value = parse_integral_display_value(&row.current)?;
+        let active = metadata
+            .bits
+            .iter()
+            .filter(|choice| bit_enabled(value, choice.value))
+            .map(|choice| format!("{}={}", choice.value, choice.label))
+            .collect::<Vec<_>>();
+        let active = if active.is_empty() {
+            "none".into()
+        } else {
+            compact_line(&active.join(" | "), 150)
+        };
+        return Some(format!("Active bits for {}: {}", row.current, active));
+    }
+
+    if !metadata.values.is_empty() {
+        let value = parse_integral_display_value(&row.current)?;
+        let label = metadata
+            .values
+            .iter()
+            .find(|choice| choice.value == value)
+            .map(|choice| choice.label.as_str())
+            .unwrap_or("unlisted value");
+        return Some(format!("Current meaning: {value} = {label}"));
+    }
+
+    if metadata.param_type.as_deref() == Some("boolean") {
+        let value = parse_integral_display_value(&row.current)?;
+        let label = if value == 0 { "Disabled" } else { "Enabled" };
+        return Some(format!("Current meaning: {value} = {label}"));
+    }
+
+    None
+}
+
+fn metadata_choices_line(metadata: &ParamMetadata) -> Option<String> {
+    if !metadata.bits.is_empty() {
+        return Some(format!("Bits: {}", format_choice_list(&metadata.bits, 150)));
+    }
+    if !metadata.values.is_empty() {
+        return Some(format!(
+            "Values: {}",
+            format_choice_list(&metadata.values, 150)
+        ));
+    }
+    if metadata.param_type.as_deref() == Some("boolean") {
+        return Some("Values: 0=Disabled | 1=Enabled".into());
+    }
+    None
+}
+
+fn format_choice_list(choices: &[ParamChoice], max_len: usize) -> String {
+    compact_line(
+        &choices
+            .iter()
+            .map(|choice| format!("{}={}", choice.value, choice.label))
+            .collect::<Vec<_>>()
+            .join(" | "),
+        max_len,
+    )
+}
+
+fn compact_line(s: &str, max_len: usize) -> String {
+    if s.chars().count() <= max_len {
+        return s.to_string();
+    }
+    let keep = max_len.saturating_sub(3);
+    format!("{}...", s.chars().take(keep).collect::<String>())
+}
+
+fn parse_integral_display_value(value: &str) -> Option<i64> {
+    value
+        .parse::<i64>()
+        .ok()
+        .or_else(|| value.parse::<f64>().ok().map(|value| value.round() as i64))
+}
+
+fn bit_enabled(value: i64, bit: i64) -> bool {
+    if !(0..63).contains(&bit) {
+        return false;
+    }
+    (value & (1_i64 << bit)) != 0
 }
 
 fn status_style(status: &str) -> Style {
@@ -2058,6 +2278,103 @@ serial_ports = {
                 &serial_port_indexes
             ),
             ("GPS1".into(), None)
+        );
+    }
+
+    #[test]
+    fn parses_px4_param_metadata_choices() {
+        let text = r#"
+parameters:
+- group: EKF2
+  definitions:
+    EKF2_GPS_CTRL:
+      description:
+        short: GNSS sensor aiding
+      type: bitmask
+      bit:
+        0: Lon/lat
+        1: Altitude
+        2: 3D velocity
+        3: Dual antenna heading
+      default: 7
+      min: 0
+      max: 15
+    EKF2_GPS_MODE:
+      type: enum
+      values:
+        0: Automatic
+        1: Dead-reckoning
+      default: 0
+"#;
+        let yaml = serde_yaml::from_str::<Value>(text).expect("yaml");
+        let wanted = HashSet::from(["EKF2_GPS_CTRL".to_string(), "EKF2_GPS_MODE".to_string()]);
+        let mut defaults = HashMap::new();
+        let mut metadata = HashMap::new();
+        let mut serial_config_params = HashSet::new();
+
+        collect_yaml_param_data(
+            &yaml,
+            &wanted,
+            &mut defaults,
+            &mut metadata,
+            &mut serial_config_params,
+        );
+
+        assert_eq!(defaults.get("EKF2_GPS_CTRL").map(String::as_str), Some("7"));
+        let gps_ctrl = metadata.get("EKF2_GPS_CTRL").expect("metadata");
+        assert_eq!(gps_ctrl.param_type.as_deref(), Some("bitmask"));
+        assert_eq!(
+            gps_ctrl.short_description.as_deref(),
+            Some("GNSS sensor aiding")
+        );
+        assert_eq!(gps_ctrl.bits.len(), 4);
+        assert_eq!(gps_ctrl.bits[3].label, "Dual antenna heading");
+        let gps_mode = metadata.get("EKF2_GPS_MODE").expect("metadata");
+        assert_eq!(gps_mode.values[1].label, "Dead-reckoning");
+    }
+
+    #[test]
+    fn formats_bitmask_detail_lines() {
+        let row = AuditRow {
+            name: "EKF2_GPS_CTRL".into(),
+            current: "7".into(),
+            baseline: "7".into(),
+            source: "firmware default".into(),
+            status: "match".into(),
+            mav_type: common::MavParamType::MAV_PARAM_TYPE_INT32,
+            metadata: Some(ParamMetadata {
+                param_type: Some("bitmask".into()),
+                bits: vec![
+                    ParamChoice {
+                        value: 0,
+                        label: "Lon/lat".into(),
+                    },
+                    ParamChoice {
+                        value: 1,
+                        label: "Altitude".into(),
+                    },
+                    ParamChoice {
+                        value: 2,
+                        label: "3D velocity".into(),
+                    },
+                    ParamChoice {
+                        value: 3,
+                        label: "Dual antenna heading".into(),
+                    },
+                ],
+                ..ParamMetadata::default()
+            }),
+        };
+
+        let metadata = row.metadata.as_ref().expect("metadata");
+
+        assert_eq!(
+            metadata_current_line(&row, metadata).as_deref(),
+            Some("Active bits for 7: 0=Lon/lat | 1=Altitude | 2=3D velocity")
+        );
+        assert_eq!(
+            metadata_choices_line(metadata).as_deref(),
+            Some("Bits: 0=Lon/lat | 1=Altitude | 2=3D velocity | 3=Dual antenna heading")
         );
     }
 

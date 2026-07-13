@@ -42,10 +42,31 @@ The binary will be at:
 target/release/px4-param-audit
 ```
 
+To also place a convenience copy in the repository root:
+
+```bash
+make local
+```
+
+That creates:
+
+```bash
+./px4-param-audit
+```
+
+The root-level binary is ignored by git. Cargo still keeps its normal build
+artifacts under `target/`.
+
 Optional local install:
 
 ```bash
 install -m 0755 target/release/px4-param-audit "$HOME/.local/bin/px4-param-audit"
+```
+
+The same install step is available through:
+
+```bash
+make install
 ```
 
 ## Usage
@@ -145,6 +166,14 @@ The TUI can edit or reset device values directly:
 - Type a numeric value.
 - Press `Enter` to write it with MAVLink `PARAM_SET`.
 - Press `Esc` to cancel editing.
+
+For parameters with PX4 metadata, the selected-row detail panel shows the
+QGroundControl-style type information from the PX4 YAML metadata. Enum
+parameters list their numeric values and labels, bitmask parameters list every
+known bit and the active bits for the current value, and boolean parameters show
+the `0=Disabled` / `1=Enabled` mapping.
+This metadata is parsed from the selected PX4 source checkout at runtime; it is
+not copied into this repository.
 
 To reset one selected parameter to the PX4 baseline value, press `d`.
 
