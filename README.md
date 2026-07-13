@@ -22,6 +22,42 @@ baseline provider.
 Normal browse/audit mode does not write parameters. Writes only happen through
 write flags and require confirmation unless `--yes` is supplied.
 
+## Dependencies
+
+Common requirements:
+
+- Rust toolchain with Cargo. Install with `rustup` unless your package manager
+  already provides a current Rust release.
+- `git` and `make`.
+- The `vendor/PX4-Autopilot` submodule, or another PX4 checkout passed with
+  `--px4-source`.
+- Access to a MAVLink endpoint: serial, UDP, or TCP.
+
+macOS:
+
+```bash
+brew install rust git make
+```
+
+USB telemetry radios and Pixhawk USB ports normally appear as `/dev/cu.*`.
+Use `./px4-param-audit --list-ports` to see the exact device path.
+
+Linux:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y build-essential pkg-config libudev-dev git
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+Serial devices commonly appear as `/dev/ttyACM*`, `/dev/ttyUSB*`, or
+`/dev/serial/by-id/*`. If the port is permission-denied, add your user to the
+serial device group and start a new login session:
+
+```bash
+sudo usermod -aG dialout "$USER"
+```
+
 ## Build
 
 Initialize the pinned PX4 baseline source:
