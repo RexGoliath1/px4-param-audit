@@ -184,6 +184,11 @@ computer on UDP `14550` and `SYS_AUTOSTART=4001`:
   --param-timeout 45
 ```
 
+Example Starling 2 session searching for `GPS_CTRL` and opening the metadata
+popup:
+
+![Starling 2 GPS_CTRL search demo](docs/assets/starling-gps-ctrl.gif)
+
 If QGroundControl or another process is already bound to `14550`, configure a
 second VOXL GCS endpoint or use a MAVLink router/proxy so each program has its
 own local UDP port.
