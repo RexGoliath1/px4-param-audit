@@ -106,13 +106,17 @@ The same install step is available through:
 make install
 ```
 
+The examples below assume you are running from the repository root after
+`make`, so they use `./px4-param-audit`. If you install the binary onto your
+`PATH`, you can omit the `./` prefix.
+
 ## Usage
 
 Close QGroundControl before using direct serial. QGC holds the Pixhawk USB serial
 port open and the audit tool cannot connect while QGC owns it.
 
 ```bash
-px4-param-audit --connect serial:/dev/cu.usbmodem01:57600
+./px4-param-audit --connect serial:/dev/cu.usbmodem01:57600
 ```
 
 To keep QGC open, do not have QGC own the USB serial port directly. Put a
@@ -153,13 +157,13 @@ serial:/dev/ttyACM0:57600
 List detected serial ports and their discovery scores:
 
 ```bash
-px4-param-audit --list-ports
+./px4-param-audit --list-ports
 ```
 
 Use a specific PX4 source checkout for baseline defaults:
 
 ```bash
-px4-param-audit \
+./px4-param-audit \
   --connect serial:/dev/cu.usbmodem01:57600 \
   --px4-source /path/to/PX4-Autopilot
 ```
@@ -172,7 +176,7 @@ baseline from the vehicle. You can still compare read-only against a known PX4
 airframe ID:
 
 ```bash
-px4-param-audit \
+./px4-param-audit \
   --connect serial:/dev/cu.usbmodem01:57600 \
   --sys-autostart 4019
 ```
@@ -182,7 +186,7 @@ PX4 airframe `4019` is `Holybro X500 V2` in the upstream airframe list.
 For non-interactive output:
 
 ```bash
-px4-param-audit \
+./px4-param-audit \
   --connect serial:/dev/cu.usbmodem01:57600 \
   --sys-autostart 4019 \
   --plain
@@ -228,7 +232,7 @@ After PX4 confirms the write, the device value and status update in the table.
 Write a single numeric parameter:
 
 ```bash
-px4-param-audit \
+./px4-param-audit \
   --connect serial:/dev/cu.usbmodem01:57600 \
   --set SYS_HAS_GPS=1
 ```
@@ -236,7 +240,7 @@ px4-param-audit \
 Write multiple explicit parameters:
 
 ```bash
-px4-param-audit \
+./px4-param-audit \
   --connect serial:/dev/cu.usbmodem01:57600 \
   --set SYS_HAS_GPS=1 \
   --set EKF2_GPS_CTRL=7
@@ -245,7 +249,7 @@ px4-param-audit \
 Write all numeric diffs that have a known PX4 baseline:
 
 ```bash
-px4-param-audit \
+./px4-param-audit \
   --connect serial:/dev/cu.usbmodem01:57600 \
   --sys-autostart 4019 \
   --write-diffs
