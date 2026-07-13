@@ -33,29 +33,30 @@ git submodule update --init --depth 1 vendor/PX4-Autopilot
 Build a compiled executable:
 
 ```bash
-cargo build --release
+make
 ```
 
-The binary will be at:
+This creates both:
 
 ```bash
 target/release/px4-param-audit
-```
-
-To also place a convenience copy in the repository root:
-
-```bash
-make local
-```
-
-That creates:
-
-```bash
 ./px4-param-audit
 ```
 
 The root-level binary is ignored by git. Cargo still keeps its normal build
 artifacts under `target/`.
+
+If you only want Cargo's normal build output:
+
+```bash
+cargo build --release
+```
+
+Remove the root-level binary and Cargo build artifacts:
+
+```bash
+make clean
+```
 
 Optional local install:
 
@@ -225,6 +226,8 @@ defaults are not written by `--write-diffs`; use an explicit numeric
 ## TUI Keys
 
 - `q`: quit
+- `?` / `m`: show a popup with all enum, boolean, or bitmask choices for the selected parameter
+- `f`: toggle between all parameters and differing parameters only
 - `e` / `Enter`: edit selected device value
 - `d`: write the selected parameter's numeric PX4 baseline value
 - `A`: prompt, then write all numeric diffs back to PX4 baseline values

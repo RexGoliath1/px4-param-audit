@@ -10,10 +10,12 @@ use mavlink::dialects::common;
 use mavlink::{MavHeader, MavlinkVersion, Message, MessageData};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell as TuiCell, Paragraph, Row, Table, TableState};
+use ratatui::widgets::{
+    Block, Borders, Cell as TuiCell, Clear, Paragraph, Row, Table, TableState, Wrap,
+};
 use serde_yaml::Value;
 use serialport::{SerialPort, SerialPortInfo, SerialPortType, UsbPortInfo};
 use std::collections::{HashMap, HashSet};
@@ -80,6 +82,13 @@ struct Args {
 struct ParamValue {
     value: f32,
     mav_type: common::MavParamType,
+    encoding: ParamEncoding,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParamEncoding {
+    CCast,
+    Bytewise,
 }
 
 #[derive(Debug, Clone)]
@@ -122,6 +131,7 @@ struct AuditRow {
     source: String,
     status: String,
     mav_type: common::MavParamType,
+    encoding: ParamEncoding,
     metadata: Option<ParamMetadata>,
 }
 
@@ -130,6 +140,7 @@ struct WriteRequest {
     name: String,
     value: f32,
     mav_type: common::MavParamType,
+    encoding: ParamEncoding,
     source: String,
 }
 
@@ -170,7 +181,11 @@ fn main() -> Result<()> {
     print_identity(&identity);
 
     request_params(&mut *conn, &identity)?;
-    let params = collect_params(&mut *conn, Duration::from_secs(args.param_timeout))?;
+    let mut params = collect_params(
+        &mut *conn,
+        &identity,
+        Duration::from_secs(args.param_timeout),
+    )?;
     println!("received {} parameters", params.len());
 
     let device_sys_autostart = params.get("SYS_AUTOSTART").map(|p| p.value.round() as i32);
@@ -190,6 +205,17 @@ fn main() -> Result<()> {
         &firmware_defaults.serial_config_params,
         &serial_port_indexes,
     );
+    let preferred_encoding = identity
+        .version
+        .as_ref()
+        .and_then(integer_encoding_from_autopilot_version);
+    let integer_encoding = infer_param_encodings(
+        &mut params,
+        &firmware_defaults.metadata,
+        &recommendations,
+        preferred_encoding,
+    );
+    println!("MAVLink integer parameter encoding: {integer_encoding:?}");
     print_baseline(device_sys_autostart, args.sys_autostart, &px4_source)?;
     print_px4_source(&px4_source);
     let rows = build_audit_rows(&params, &recommendations, &firmware_defaults.metadata);
@@ -787,26 +813,24 @@ fn request_params(conn: &mut dyn MavTransport, identity: &VehicleIdentity) -> Re
 
 fn collect_params(
     conn: &mut dyn MavTransport,
+    identity: &VehicleIdentity,
     timeout: Duration,
 ) -> Result<HashMap<String, ParamValue>> {
     let deadline = Instant::now() + timeout;
     let mut params = HashMap::new();
+    let mut received_indices = HashSet::new();
+    let mut expected_count = 0usize;
     while Instant::now() < deadline {
         match conn.recv() {
             Some((_, common::MavMessage::PARAM_VALUE(param))) => {
-                let name = param.param_id.to_str().unwrap_or("").to_string();
-                if !name.is_empty() {
-                    let expected_count = param.param_count as usize;
-                    params.insert(
-                        name,
-                        ParamValue {
-                            value: param.param_value,
-                            mav_type: param.param_type,
-                        },
-                    );
-                    if expected_count > 0 && params.len() >= expected_count {
-                        return Ok(params);
-                    }
+                update_param_collection(
+                    param,
+                    &mut params,
+                    &mut received_indices,
+                    &mut expected_count,
+                );
+                if expected_count > 0 && received_indices.len() >= expected_count {
+                    return Ok(params);
                 }
             }
             Some(_) => {}
@@ -814,10 +838,124 @@ fn collect_params(
         }
     }
 
+    if expected_count > 0 && received_indices.len() < expected_count {
+        recover_missing_params(
+            conn,
+            identity,
+            &mut params,
+            &mut received_indices,
+            expected_count,
+            timeout.min(Duration::from_secs(15)),
+        )?;
+    }
+
     if params.is_empty() {
         bail!("timed out waiting for PARAM_VALUE messages");
     }
     Ok(params)
+}
+
+fn update_param_collection(
+    param: common::PARAM_VALUE_DATA,
+    params: &mut HashMap<String, ParamValue>,
+    received_indices: &mut HashSet<u16>,
+    expected_count: &mut usize,
+) {
+    let name = param.param_id.to_str().unwrap_or("").to_string();
+    if name.is_empty() {
+        return;
+    }
+    if param.param_count > 0 {
+        *expected_count = (*expected_count).max(param.param_count as usize);
+    }
+    received_indices.insert(param.param_index);
+    params.insert(
+        name,
+        ParamValue {
+            value: param.param_value,
+            mav_type: param.param_type,
+            encoding: ParamEncoding::CCast,
+        },
+    );
+}
+
+fn recover_missing_params(
+    conn: &mut dyn MavTransport,
+    identity: &VehicleIdentity,
+    params: &mut HashMap<String, ParamValue>,
+    received_indices: &mut HashSet<u16>,
+    expected_count: usize,
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    let mut next_request = Instant::now();
+    let mut missing_cursor = 0usize;
+
+    while Instant::now() < deadline && received_indices.len() < expected_count {
+        if Instant::now() >= next_request {
+            request_missing_param_indexes(
+                conn,
+                identity,
+                expected_count,
+                received_indices,
+                &mut missing_cursor,
+            )?;
+            next_request = Instant::now() + Duration::from_millis(700);
+        }
+
+        match conn.recv() {
+            Some((_, common::MavMessage::PARAM_VALUE(param))) => {
+                let mut observed_count = expected_count;
+                update_param_collection(param, params, received_indices, &mut observed_count);
+            }
+            Some(_) => {}
+            None => thread::sleep(Duration::from_millis(5)),
+        }
+    }
+
+    Ok(())
+}
+
+fn request_missing_param_indexes(
+    conn: &mut dyn MavTransport,
+    identity: &VehicleIdentity,
+    expected_count: usize,
+    received_indices: &HashSet<u16>,
+    cursor: &mut usize,
+) -> Result<()> {
+    let count = expected_count.min(i16::MAX as usize);
+    let mut sent = 0usize;
+
+    for offset in 0..count {
+        let index = (*cursor + offset) % count;
+        if received_indices.contains(&(index as u16)) {
+            continue;
+        }
+        request_param_by_index(conn, identity, index as i16)?;
+        sent += 1;
+        if sent >= 50 {
+            *cursor = (index + 1) % count;
+            return Ok(());
+        }
+    }
+
+    *cursor = 0;
+    Ok(())
+}
+
+fn request_param_by_index(
+    conn: &mut dyn MavTransport,
+    identity: &VehicleIdentity,
+    index: i16,
+) -> Result<()> {
+    let msg = common::MavMessage::PARAM_REQUEST_READ(common::PARAM_REQUEST_READ_DATA {
+        target_system: identity.system_id,
+        target_component: identity.component_id,
+        param_id: "".into(),
+        param_index: index,
+    });
+    conn.send(&msg)?;
+    Ok(())
 }
 
 fn build_write_plan(
@@ -841,6 +979,7 @@ fn build_write_plan(
                     name: row.name.clone(),
                     value,
                     mav_type: row.mav_type,
+                    encoding: row.encoding,
                     source: format!("PX4 baseline ({})", row.source),
                 },
             );
@@ -858,6 +997,7 @@ fn build_write_plan(
                 name,
                 value,
                 mav_type: current.mav_type,
+                encoding: current.encoding,
                 source: "--set".into(),
             },
         );
@@ -897,8 +1037,8 @@ fn confirm_writes(writes: &[WriteRequest], yes: bool) -> Result<()> {
     println!("planned writes:");
     for write in writes {
         println!(
-            "  {} = {} ({:?}, {})",
-            write.name, write.value, write.mav_type, write.source
+            "  {} = {} ({:?}, {:?}, {})",
+            write.name, write.value, write.mav_type, write.encoding, write.source
         );
     }
 
@@ -930,7 +1070,7 @@ fn apply_writes(
 ) -> Result<()> {
     for write in writes {
         send_param_set(conn, identity, &write)?;
-        let confirmed = wait_for_param_confirmation(conn, &write.name, timeout)
+        let confirmed = wait_for_param_confirmation(conn, &write.name, timeout, write.encoding)
             .with_context(|| format!("PX4 did not confirm {}", write.name))?;
         println!("set {} = {}", write.name, format_param(&confirmed));
     }
@@ -942,7 +1082,7 @@ fn send_param_set(
     identity: &VehicleIdentity,
     write: &WriteRequest,
 ) -> Result<()> {
-    let param_value = encode_param_set_value(write.value, write.mav_type)
+    let param_value = encode_param_set_value(write.value, write.mav_type, write.encoding)
         .with_context(|| format!("cannot encode {} for {:?}", write.name, write.mav_type))?;
     let msg = common::MavMessage::PARAM_SET(common::PARAM_SET_DATA {
         target_system: identity.system_id,
@@ -959,6 +1099,7 @@ fn wait_for_param_confirmation(
     conn: &mut dyn MavTransport,
     name: &str,
     timeout: Duration,
+    encoding: ParamEncoding,
 ) -> Result<ParamValue> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -969,6 +1110,7 @@ fn wait_for_param_confirmation(
                     return Ok(ParamValue {
                         value: param.param_value,
                         mav_type: param.param_type,
+                        encoding,
                     });
                 }
             }
@@ -1416,6 +1558,151 @@ fn recommendation_source(base: &str, label: Option<&str>) -> String {
     }
 }
 
+fn infer_param_encodings(
+    params: &mut HashMap<String, ParamValue>,
+    metadata: &HashMap<String, ParamMetadata>,
+    recommendations: &HashMap<String, Recommendation>,
+    preferred: Option<ParamEncoding>,
+) -> ParamEncoding {
+    let global = preferred
+        .unwrap_or_else(|| infer_global_integer_encoding(params, metadata, recommendations));
+    for (name, param) in params {
+        if !is_integer_param_type(param.mav_type) {
+            param.encoding = ParamEncoding::CCast;
+            continue;
+        }
+        param.encoding = infer_integer_param_encoding(
+            param,
+            metadata.get(name),
+            recommendations.get(name),
+            global,
+        );
+    }
+    global
+}
+
+fn integer_encoding_from_autopilot_version(
+    version: &common::AUTOPILOT_VERSION_DATA,
+) -> Option<ParamEncoding> {
+    let bytewise = version
+        .capabilities
+        .contains(common::MavProtocolCapability::MAV_PROTOCOL_CAPABILITY_PARAM_ENCODE_BYTEWISE);
+    let ccast = version
+        .capabilities
+        .contains(common::MavProtocolCapability::MAV_PROTOCOL_CAPABILITY_PARAM_ENCODE_C_CAST);
+
+    match (bytewise, ccast) {
+        (true, false) => Some(ParamEncoding::Bytewise),
+        (false, true) => Some(ParamEncoding::CCast),
+        _ => None,
+    }
+}
+
+fn infer_global_integer_encoding(
+    params: &HashMap<String, ParamValue>,
+    metadata: &HashMap<String, ParamMetadata>,
+    recommendations: &HashMap<String, Recommendation>,
+) -> ParamEncoding {
+    let mut bytewise_score = 0_i32;
+    let mut ccast_score = 0_i32;
+
+    for (name, param) in params {
+        if !is_integer_param_type(param.mav_type) {
+            continue;
+        }
+        let (byte_score, cast_score) =
+            encoding_scores(param, metadata.get(name), recommendations.get(name));
+        let delta = byte_score - cast_score;
+        if delta >= 4 {
+            bytewise_score += delta;
+        } else if delta <= -4 {
+            ccast_score += -delta;
+        }
+    }
+
+    if bytewise_score > ccast_score {
+        ParamEncoding::Bytewise
+    } else {
+        ParamEncoding::CCast
+    }
+}
+
+fn infer_integer_param_encoding(
+    param: &ParamValue,
+    metadata: Option<&ParamMetadata>,
+    recommendation: Option<&Recommendation>,
+    fallback: ParamEncoding,
+) -> ParamEncoding {
+    let (byte_score, cast_score) = encoding_scores(param, metadata, recommendation);
+    if byte_score >= cast_score + 3 {
+        ParamEncoding::Bytewise
+    } else if cast_score >= byte_score + 3 {
+        ParamEncoding::CCast
+    } else {
+        fallback
+    }
+}
+
+fn encoding_scores(
+    param: &ParamValue,
+    metadata: Option<&ParamMetadata>,
+    recommendation: Option<&Recommendation>,
+) -> (i32, i32) {
+    let bytewise = decode_integer_value(param.value, param.mav_type, ParamEncoding::Bytewise);
+    let ccast = decode_integer_value(param.value, param.mav_type, ParamEncoding::CCast);
+    let mut byte_score = bytewise.map(|_| 1).unwrap_or(-10);
+    let mut cast_score = ccast.map(|_| 1).unwrap_or(-10);
+    let range = metadata.and_then(param_integer_range);
+
+    if let Some((min, max)) = range {
+        score_range(&mut byte_score, bytewise, min, max);
+        score_range(&mut cast_score, ccast, min, max);
+    }
+
+    if let Some(baseline) = recommendation
+        .and_then(|rec| parse_integral_display_value(&rec.value))
+        .filter(|_| range.is_some() || metadata.is_some())
+    {
+        if bytewise == Some(baseline) {
+            byte_score += 4;
+        }
+        if ccast == Some(baseline) {
+            cast_score += 4;
+        }
+    }
+
+    if param.value.is_finite() && (param.value - param.value.round()).abs() <= f32::EPSILON {
+        cast_score += 2;
+    }
+    if param.value != 0.0 && param.value.abs() < f32::MIN_POSITIVE {
+        byte_score += 2;
+    }
+
+    (byte_score, cast_score)
+}
+
+fn score_range(score: &mut i32, value: Option<i64>, min: i64, max: i64) {
+    match value {
+        Some(value) if value >= min && value <= max => *score += 6,
+        Some(_) => *score -= 6,
+        None => *score -= 6,
+    }
+}
+
+fn param_integer_range(metadata: &ParamMetadata) -> Option<(i64, i64)> {
+    let min = metadata
+        .min
+        .as_deref()
+        .and_then(parse_integral_display_value)
+        .unwrap_or(i64::MIN);
+    let max = metadata
+        .max
+        .as_deref()
+        .and_then(parse_integral_display_value)
+        .unwrap_or(i64::MAX);
+    (min <= max).then_some((min, max))
+}
+
 fn build_audit_rows(
     params: &HashMap<String, ParamValue>,
     recommendations: &HashMap<String, Recommendation>,
@@ -1440,6 +1727,7 @@ fn build_audit_rows(
                 source,
                 status,
                 mav_type: value.mav_type,
+                encoding: value.encoding,
                 metadata: metadata.get(name).cloned(),
             }
         })
@@ -1477,6 +1765,7 @@ struct TuiApp {
     query: String,
     edit_value: String,
     pending_writes: Vec<WriteRequest>,
+    show_diffs_only: bool,
     mode: TuiMode,
     selected: usize,
     status_message: String,
@@ -1488,6 +1777,7 @@ enum TuiMode {
     Search,
     Edit,
     ConfirmDefaults,
+    MetadataPopup,
 }
 
 enum TuiAction {
@@ -1506,9 +1796,11 @@ impl TuiApp {
             query: String::new(),
             edit_value: String::new(),
             pending_writes: Vec::new(),
+            show_diffs_only: false,
             mode: TuiMode::Browse,
             selected: 0,
-            status_message: "Browse: e/Enter edit, d default selected, A default all".into(),
+            status_message: "Browse: f diffs/all, e/Enter edit, d default selected, A default all"
+                .into(),
         }
     }
 
@@ -1530,13 +1822,7 @@ impl TuiApp {
             .iter()
             .enumerate()
             .filter_map(|(index, row)| {
-                if query.is_empty()
-                    || row.name.to_lowercase().contains(&query)
-                    || row.current.to_lowercase().contains(&query)
-                    || row.baseline.to_lowercase().contains(&query)
-                    || row.source.to_lowercase().contains(&query)
-                    || row.status.to_lowercase().contains(&query)
-                {
+                if self.row_is_visible(row) && row_matches_query(row, &query) {
                     Some(index)
                 } else {
                     None
@@ -1544,6 +1830,28 @@ impl TuiApp {
             })
             .collect();
         self.clamp_selection();
+    }
+
+    fn row_is_visible(&self, row: &AuditRow) -> bool {
+        !self.show_diffs_only || row.status == "diff"
+    }
+
+    fn view_label(&self) -> &'static str {
+        if self.show_diffs_only {
+            "diffs only"
+        } else {
+            "all params"
+        }
+    }
+
+    fn toggle_diffs_only(&mut self) {
+        self.show_diffs_only = !self.show_diffs_only;
+        self.apply_filter();
+        self.status_message = if self.show_diffs_only {
+            format!("Showing {} differing parameter(s)", self.filtered.len())
+        } else {
+            format!("Showing all {} parameter(s)", self.rows.len())
+        };
     }
 
     fn clamp_selection(&mut self) {
@@ -1600,6 +1908,7 @@ impl TuiApp {
         let name = row.name.clone();
         let baseline = row.baseline.clone();
         let mav_type = row.mav_type;
+        let encoding = row.encoding;
         let source = row.source.clone();
         let current = row.current.clone();
 
@@ -1613,6 +1922,7 @@ impl TuiApp {
                 name,
                 value,
                 mav_type,
+                encoding,
                 source: format!("TUI default selected ({source})"),
             }),
             Err(_) => {
@@ -1632,6 +1942,7 @@ impl TuiApp {
                     name: row.name.clone(),
                     value,
                     mav_type: row.mav_type,
+                    encoding: row.encoding,
                     source: format!("TUI default all ({})", row.source),
                 })
             })
@@ -1651,6 +1962,15 @@ impl TuiApp {
             self.pending_writes.len()
         );
     }
+}
+
+fn row_matches_query(row: &AuditRow, query: &str) -> bool {
+    query.is_empty()
+        || row.name.to_lowercase().contains(query)
+        || row.current.to_lowercase().contains(query)
+        || row.baseline.to_lowercase().contains(query)
+        || row.source.to_lowercase().contains(query)
+        || row.status.to_lowercase().contains(query)
 }
 
 fn run_tui(
@@ -1701,7 +2021,7 @@ fn run_tui_loop(
                 app.status_message = format!("Writing {} = {}...", write.name, write.value);
                 terminal.draw(|frame| draw_tui(frame, &app))?;
                 match send_param_set(conn, identity, &write).and_then(|_| {
-                    wait_for_param_confirmation(conn, &write.name, write_timeout)
+                    wait_for_param_confirmation(conn, &write.name, write_timeout, write.encoding)
                         .with_context(|| format!("PX4 did not confirm {}", write.name))
                 }) {
                     Ok(confirmed) => {
@@ -1730,8 +2050,13 @@ fn run_tui_loop(
                     );
                     terminal.draw(|frame| draw_tui(frame, &app))?;
                     match send_param_set(conn, identity, &write).and_then(|_| {
-                        wait_for_param_confirmation(conn, &write.name, write_timeout)
-                            .with_context(|| format!("PX4 did not confirm {}", write.name))
+                        wait_for_param_confirmation(
+                            conn,
+                            &write.name,
+                            write_timeout,
+                            write.encoding,
+                        )
+                        .with_context(|| format!("PX4 did not confirm {}", write.name))
                     }) {
                         Ok(confirmed) => {
                             written += 1;
@@ -1756,6 +2081,18 @@ fn run_tui_loop(
 }
 
 fn handle_key(app: &mut TuiApp, key: KeyEvent) -> TuiAction {
+    if app.mode == TuiMode::MetadataPopup {
+        match key.code {
+            KeyCode::Char('q') => return TuiAction::Quit,
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?') | KeyCode::Char('m') => {
+                app.mode = TuiMode::Browse;
+                app.status_message = "Metadata popup closed".into();
+            }
+            _ => {}
+        }
+        return TuiAction::Continue;
+    }
+
     if app.mode == TuiMode::ConfirmDefaults {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
@@ -1814,6 +2151,7 @@ fn handle_key(app: &mut TuiApp, key: KeyEvent) -> TuiAction {
                             name: row.name.clone(),
                             value,
                             mav_type: row.mav_type,
+                            encoding: row.encoding,
                             source: "TUI edit".into(),
                         });
                     }
@@ -1838,6 +2176,19 @@ fn handle_key(app: &mut TuiApp, key: KeyEvent) -> TuiAction {
         KeyCode::Char('q') => TuiAction::Quit,
         KeyCode::Char('/') => {
             app.mode = TuiMode::Search;
+            TuiAction::Continue
+        }
+        KeyCode::Char('?') | KeyCode::Char('m') => {
+            if app.selected_row().is_some_and(row_has_metadata_choices) {
+                app.mode = TuiMode::MetadataPopup;
+            } else {
+                app.status_message =
+                    "No enum, boolean, or bitmask metadata for selected parameter".into();
+            }
+            TuiAction::Continue
+        }
+        KeyCode::Char('f') if key.modifiers.is_empty() => {
+            app.toggle_diffs_only();
             TuiAction::Continue
         }
         KeyCode::Enter | KeyCode::Char('e') => {
@@ -1906,15 +2257,19 @@ fn draw_tui(frame: &mut ratatui::Frame, app: &TuiApp) {
         .split(frame.area());
 
     let input_title = match app.mode {
-        TuiMode::Browse => "Search (/), Edit (e/Enter), Default selected (d), Default all (A)",
+        TuiMode::Browse => {
+            "Search (/), Toggle diffs/all (f), Edit (e/Enter), Default selected (d), Default all (A)"
+        }
         TuiMode::Search => "Search (Enter done, Esc clear)",
         TuiMode::Edit => "Edit value (Enter writes, Esc cancels)",
         TuiMode::ConfirmDefaults => "Reset all numeric diffs to PX4 baseline? y/n",
+        TuiMode::MetadataPopup => "Metadata choices (Enter/Esc closes)",
     };
     let input_style = match app.mode {
         TuiMode::Search => Style::default().yellow(),
         TuiMode::Edit => Style::default().cyan(),
         TuiMode::ConfirmDefaults => Style::default().red().bold(),
+        TuiMode::MetadataPopup => Style::default().green(),
         TuiMode::Browse => Style::default(),
     };
     let input_value = match app.mode {
@@ -1922,6 +2277,7 @@ fn draw_tui(frame: &mut ratatui::Frame, app: &TuiApp) {
         TuiMode::ConfirmDefaults => {
             "WARNING: all numeric non-default values will be reset on the device"
         }
+        TuiMode::MetadataPopup => "Enum/bitmask metadata popup is open",
         _ => app.query.as_str(),
     };
     let input = Paragraph::new(input_value)
@@ -1941,7 +2297,8 @@ fn draw_tui(frame: &mut ratatui::Frame, app: &TuiApp) {
     });
 
     let title = format!(
-        "PX4 Params - {} of {} shown",
+        "PX4 Params - {} - {} of {} shown",
+        app.view_label(),
         app.filtered.len(),
         app.rows.len()
     );
@@ -1977,7 +2334,7 @@ fn draw_tui(frame: &mut ratatui::Frame, app: &TuiApp) {
             vec![
                 Line::from("No matching parameters"),
                 Line::from(app.status_message.as_str()),
-                Line::from("Keys: q quit | / search | Esc clear search"),
+                Line::from("Keys: q quit | f diffs/all | / search | Esc clear search"),
             ]
         });
 
@@ -1985,6 +2342,118 @@ fn draw_tui(frame: &mut ratatui::Frame, app: &TuiApp) {
         Paragraph::new(detail).block(Block::default().borders(Borders::ALL).title("Status")),
         chunks[2],
     );
+
+    if app.mode == TuiMode::MetadataPopup {
+        draw_metadata_popup(frame, app);
+    }
+}
+
+fn draw_metadata_popup(frame: &mut ratatui::Frame, app: &TuiApp) {
+    let Some(row) = app.selected_row() else {
+        return;
+    };
+    let area = centered_rect(84, 70, frame.area());
+    let lines = metadata_popup_lines(row);
+    let title = format!("{} metadata - ?/Enter/Esc close", row.name);
+    let popup = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(Clear, area);
+    frame.render_widget(popup, area);
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+    let horizontal = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vertical[1]);
+    horizontal[1]
+}
+
+fn row_has_metadata_choices(row: &AuditRow) -> bool {
+    row.metadata.as_ref().is_some_and(|metadata| {
+        !metadata.bits.is_empty()
+            || !metadata.values.is_empty()
+            || metadata.param_type.as_deref() == Some("boolean")
+    })
+}
+
+fn metadata_popup_lines(row: &AuditRow) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let Some(metadata) = &row.metadata else {
+        return vec![Line::from("No PX4 metadata for this parameter")];
+    };
+
+    lines.push(Line::from(vec![
+        Span::styled("Current: ", Style::default().bold()),
+        Span::raw(row.current.clone()),
+        Span::raw("  "),
+        Span::styled("Baseline: ", Style::default().bold()),
+        Span::raw(row.baseline.clone()),
+    ]));
+    if let Some(summary) = metadata_summary_line(metadata) {
+        lines.push(Line::from(summary));
+    }
+    if let Some(description) = &metadata.short_description {
+        lines.push(Line::from(format!("Description: {description}")));
+    }
+    lines.push(Line::from(""));
+
+    if !metadata.bits.is_empty() {
+        let current = parse_integral_display_value(&row.current).unwrap_or_default();
+        lines.push(Line::from("Bits:"));
+        for choice in &metadata.bits {
+            let active = bit_enabled(current, choice.value);
+            lines.push(choice_line(choice.value, &choice.label, active));
+        }
+    } else if !metadata.values.is_empty() {
+        let current = parse_integral_display_value(&row.current).unwrap_or_default();
+        lines.push(Line::from("Values:"));
+        for choice in &metadata.values {
+            lines.push(choice_line(
+                choice.value,
+                &choice.label,
+                choice.value == current,
+            ));
+        }
+    } else if metadata.param_type.as_deref() == Some("boolean") {
+        let current = parse_integral_display_value(&row.current).unwrap_or_default();
+        lines.push(Line::from("Values:"));
+        lines.push(choice_line(0, "Disabled", current == 0));
+        lines.push(choice_line(1, "Enabled", current != 0));
+    } else {
+        lines.push(Line::from(
+            "No enum, boolean, or bitmask choices for this parameter",
+        ));
+    }
+
+    lines
+}
+
+fn choice_line(value: i64, label: &str, active: bool) -> Line<'static> {
+    let prefix = if active { "  * " } else { "    " };
+    let style = if active {
+        Style::default().green().bold()
+    } else {
+        Style::default()
+    };
+    Line::from(vec![
+        Span::styled(prefix, style),
+        Span::styled(format!("{value}: "), style),
+        Span::styled(label.to_string(), style),
+    ])
 }
 
 fn selected_detail_lines(row: &AuditRow, status_message: &str) -> Vec<Line<'static>> {
@@ -2015,7 +2484,7 @@ fn selected_detail_lines(row: &AuditRow, status_message: &str) -> Vec<Line<'stat
 
     lines.push(Line::from(status_message.to_string()));
     lines.push(Line::from(
-        "Keys: q quit | e/Enter edit | d default selected | A default all | / search | arrows/j/k scroll",
+        "Keys: q quit | ? metadata | f diffs/all | e/Enter edit | d default selected | A default all | / search",
     ));
     lines
 }
@@ -2140,27 +2609,33 @@ fn status_style(status: &str) -> Style {
 }
 
 fn format_param(param: &ParamValue) -> String {
-    match param.mav_type {
-        common::MavParamType::MAV_PARAM_TYPE_UINT8 => format!("{}", param.value.to_bits() & 0xff),
-        common::MavParamType::MAV_PARAM_TYPE_INT8 => {
-            format!("{}", (param.value.to_bits() as u8) as i8)
-        }
-        common::MavParamType::MAV_PARAM_TYPE_UINT16 => {
-            format!("{}", param.value.to_bits() & 0xffff)
-        }
-        common::MavParamType::MAV_PARAM_TYPE_INT16 => {
-            format!("{}", (param.value.to_bits() as u16) as i16)
-        }
-        common::MavParamType::MAV_PARAM_TYPE_UINT32 => format!("{}", param.value.to_bits()),
-        common::MavParamType::MAV_PARAM_TYPE_INT32 => format!("{}", param.value.to_bits() as i32),
-        _ => {
-            let s = format!("{:.6}", param.value);
-            s.trim_end_matches('0').trim_end_matches('.').to_string()
+    if is_integer_param_type(param.mav_type) {
+        if let Some(value) = decode_integer_value(param.value, param.mav_type, param.encoding) {
+            return value.to_string();
         }
     }
+    format_float_param(param.value)
 }
 
-fn encode_param_set_value(value: f32, mav_type: common::MavParamType) -> Result<f32> {
+fn format_float_param(value: f32) -> String {
+    let s = format!("{value:.6}");
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+fn encode_param_set_value(
+    value: f32,
+    mav_type: common::MavParamType,
+    encoding: ParamEncoding,
+) -> Result<f32> {
+    if !is_integer_param_type(mav_type) {
+        return Ok(value);
+    }
+
+    if encoding == ParamEncoding::CCast {
+        checked_integer_for_type(value, mav_type)?;
+        return Ok(value);
+    }
+
     match mav_type {
         common::MavParamType::MAV_PARAM_TYPE_UINT8 => {
             Ok(f32::from_bits(
@@ -2192,8 +2667,76 @@ fn encode_param_set_value(value: f32, mav_type: common::MavParamType) -> Result<
                 checked_integer(value, i32::MIN as i64, i32::MAX as i64)? as i32 as u32,
             ))
         }
-        _ => Ok(value),
+        _ => unreachable!("integer MAVLink parameter type was already checked"),
     }
+}
+
+fn checked_integer_for_type(value: f32, mav_type: common::MavParamType) -> Result<i64> {
+    match mav_type {
+        common::MavParamType::MAV_PARAM_TYPE_UINT8 => checked_integer(value, 0, u8::MAX as i64),
+        common::MavParamType::MAV_PARAM_TYPE_INT8 => {
+            checked_integer(value, i8::MIN as i64, i8::MAX as i64)
+        }
+        common::MavParamType::MAV_PARAM_TYPE_UINT16 => checked_integer(value, 0, u16::MAX as i64),
+        common::MavParamType::MAV_PARAM_TYPE_INT16 => {
+            checked_integer(value, i16::MIN as i64, i16::MAX as i64)
+        }
+        common::MavParamType::MAV_PARAM_TYPE_UINT32 => checked_integer(value, 0, u32::MAX as i64),
+        common::MavParamType::MAV_PARAM_TYPE_INT32 => {
+            checked_integer(value, i32::MIN as i64, i32::MAX as i64)
+        }
+        _ => bail!("not an integer MAVLink parameter type: {mav_type:?}"),
+    }
+}
+
+fn is_integer_param_type(mav_type: common::MavParamType) -> bool {
+    matches!(
+        mav_type,
+        common::MavParamType::MAV_PARAM_TYPE_UINT8
+            | common::MavParamType::MAV_PARAM_TYPE_INT8
+            | common::MavParamType::MAV_PARAM_TYPE_UINT16
+            | common::MavParamType::MAV_PARAM_TYPE_INT16
+            | common::MavParamType::MAV_PARAM_TYPE_UINT32
+            | common::MavParamType::MAV_PARAM_TYPE_INT32
+    )
+}
+
+fn decode_integer_value(
+    value: f32,
+    mav_type: common::MavParamType,
+    encoding: ParamEncoding,
+) -> Option<i64> {
+    match encoding {
+        ParamEncoding::CCast => decode_integer_ccast(value, mav_type),
+        ParamEncoding::Bytewise => decode_integer_bytewise(value, mav_type),
+    }
+}
+
+fn decode_integer_ccast(value: f32, mav_type: common::MavParamType) -> Option<i64> {
+    if !value.is_finite() {
+        return None;
+    }
+    let rounded = value.round();
+    if (value - rounded).abs() > 0.0001 {
+        return None;
+    }
+    let integer = rounded as i64;
+    checked_integer_for_type(integer as f32, mav_type).ok()?;
+    Some(integer)
+}
+
+fn decode_integer_bytewise(value: f32, mav_type: common::MavParamType) -> Option<i64> {
+    let bits = value.to_bits();
+    let integer = match mav_type {
+        common::MavParamType::MAV_PARAM_TYPE_UINT8 => (bits & 0xff) as i64,
+        common::MavParamType::MAV_PARAM_TYPE_INT8 => ((bits as u8) as i8) as i64,
+        common::MavParamType::MAV_PARAM_TYPE_UINT16 => (bits & 0xffff) as i64,
+        common::MavParamType::MAV_PARAM_TYPE_INT16 => ((bits as u16) as i16) as i64,
+        common::MavParamType::MAV_PARAM_TYPE_UINT32 => bits as i64,
+        common::MavParamType::MAV_PARAM_TYPE_INT32 => (bits as i32) as i64,
+        _ => return None,
+    };
+    Some(integer)
 }
 
 fn checked_integer(value: f32, min: i64, max: i64) -> Result<i64> {
@@ -2342,6 +2885,7 @@ parameters:
             source: "firmware default".into(),
             status: "match".into(),
             mav_type: common::MavParamType::MAV_PARAM_TYPE_INT32,
+            encoding: ParamEncoding::CCast,
             metadata: Some(ParamMetadata {
                 param_type: Some("bitmask".into()),
                 bits: vec![
@@ -2379,29 +2923,175 @@ parameters:
     }
 
     #[test]
+    fn toggles_diff_only_view_with_search_filter() {
+        let mut app = TuiApp::new(vec![
+            test_row("EKF2_GPS_CTRL", "diff"),
+            test_row("EKF2_REQ_EPH", "match"),
+            test_row("GPS_1_CONFIG", "diff"),
+        ]);
+
+        assert_eq!(app.filtered.len(), 3);
+        assert_eq!(app.view_label(), "all params");
+
+        app.toggle_diffs_only();
+        assert_eq!(app.view_label(), "diffs only");
+        assert_eq!(app.filtered.len(), 2);
+        assert_eq!(
+            app.selected_row().map(|row| row.name.as_str()),
+            Some("EKF2_GPS_CTRL")
+        );
+
+        app.query = "GPS".into();
+        app.apply_filter();
+        let filtered_names = app
+            .filtered
+            .iter()
+            .map(|index| app.rows[*index].name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(filtered_names, vec!["EKF2_GPS_CTRL", "GPS_1_CONFIG"]);
+
+        app.toggle_diffs_only();
+        assert_eq!(app.view_label(), "all params");
+        let filtered_names = app
+            .filtered
+            .iter()
+            .map(|index| app.rows[*index].name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(filtered_names, vec!["EKF2_GPS_CTRL", "GPS_1_CONFIG"]);
+    }
+
+    #[test]
     fn encodes_px4_int32_param_sets_bytewise() {
-        let encoded = encode_param_set_value(7.0, common::MavParamType::MAV_PARAM_TYPE_INT32)
-            .expect("encode int32");
+        let encoded = encode_param_set_value(
+            7.0,
+            common::MavParamType::MAV_PARAM_TYPE_INT32,
+            ParamEncoding::Bytewise,
+        )
+        .expect("encode int32");
 
         assert_eq!(encoded.to_bits(), 7);
         assert_ne!(encoded.to_bits(), 7.0f32.to_bits());
     }
 
     #[test]
-    fn formats_px4_int32_param_values_bytewise() {
+    fn encodes_px4_int32_param_sets_ccast() {
+        let encoded = encode_param_set_value(
+            7.0,
+            common::MavParamType::MAV_PARAM_TYPE_INT32,
+            ParamEncoding::CCast,
+        )
+        .expect("encode int32");
+
+        assert_eq!(encoded, 7.0);
+    }
+
+    #[test]
+    fn formats_px4_int32_param_values_for_selected_encoding() {
         let param = ParamValue {
             value: f32::from_bits(7),
             mav_type: common::MavParamType::MAV_PARAM_TYPE_INT32,
+            encoding: ParamEncoding::Bytewise,
         };
 
         assert_eq!(format_param(&param), "7");
+
+        let param = ParamValue {
+            value: 2047.0,
+            mav_type: common::MavParamType::MAV_PARAM_TYPE_INT32,
+            encoding: ParamEncoding::CCast,
+        };
+
+        assert_eq!(format_param(&param), "2047");
+    }
+
+    #[test]
+    fn infers_ccast_integer_encoding_from_px4_metadata_range() {
+        let mut params = HashMap::from([(
+            "EKF2_GPS_CHECK".into(),
+            ParamValue {
+                value: 2047.0,
+                mav_type: common::MavParamType::MAV_PARAM_TYPE_INT32,
+                encoding: ParamEncoding::CCast,
+            },
+        )]);
+        let metadata = HashMap::from([(
+            "EKF2_GPS_CHECK".into(),
+            ParamMetadata {
+                min: Some("0".into()),
+                max: Some("4095".into()),
+                ..ParamMetadata::default()
+            },
+        )]);
+        let recommendations = HashMap::from([(
+            "EKF2_GPS_CHECK".into(),
+            Recommendation {
+                value: "2047".into(),
+                source: "firmware default".into(),
+            },
+        )]);
+
+        infer_param_encodings(&mut params, &metadata, &recommendations, None);
+
+        let param = params.get("EKF2_GPS_CHECK").expect("param");
+        assert_eq!(param.encoding, ParamEncoding::CCast);
+        assert_eq!(format_param(param), "2047");
+    }
+
+    #[test]
+    fn infers_bytewise_integer_encoding_from_px4_metadata_range() {
+        let mut params = HashMap::from([(
+            "EKF2_GPS_CHECK".into(),
+            ParamValue {
+                value: f32::from_bits(2047),
+                mav_type: common::MavParamType::MAV_PARAM_TYPE_INT32,
+                encoding: ParamEncoding::CCast,
+            },
+        )]);
+        let metadata = HashMap::from([(
+            "EKF2_GPS_CHECK".into(),
+            ParamMetadata {
+                min: Some("0".into()),
+                max: Some("4095".into()),
+                ..ParamMetadata::default()
+            },
+        )]);
+        let recommendations = HashMap::from([(
+            "EKF2_GPS_CHECK".into(),
+            Recommendation {
+                value: "2047".into(),
+                source: "firmware default".into(),
+            },
+        )]);
+
+        infer_param_encodings(&mut params, &metadata, &recommendations, None);
+
+        let param = params.get("EKF2_GPS_CHECK").expect("param");
+        assert_eq!(param.encoding, ParamEncoding::Bytewise);
+        assert_eq!(format_param(param), "2047");
     }
 
     #[test]
     fn rejects_fractional_integer_writes() {
-        let err = encode_param_set_value(7.5, common::MavParamType::MAV_PARAM_TYPE_INT32)
-            .expect_err("fractional int write should fail");
+        let err = encode_param_set_value(
+            7.5,
+            common::MavParamType::MAV_PARAM_TYPE_INT32,
+            ParamEncoding::CCast,
+        )
+        .expect_err("fractional int write should fail");
 
         assert!(err.to_string().contains("must be whole"));
+    }
+
+    fn test_row(name: &str, status: &str) -> AuditRow {
+        AuditRow {
+            name: name.into(),
+            current: "1".into(),
+            baseline: "0".into(),
+            source: "firmware default".into(),
+            status: status.into(),
+            mav_type: common::MavParamType::MAV_PARAM_TYPE_INT32,
+            encoding: ParamEncoding::CCast,
+            metadata: None,
+        }
     }
 }
