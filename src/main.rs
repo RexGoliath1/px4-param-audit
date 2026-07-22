@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail, ensure};
 use clap::Parser;
 use comfy_table::{Cell, Color, Table as PlainTable};
+use crossterm::cursor::Show;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -19,6 +20,7 @@ use ratatui::widgets::{
 use serde_yaml::Value;
 use serialport::{SerialPort, SerialPortInfo, SerialPortType, UsbPortInfo};
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::fs;
 use std::io::{self, ErrorKind, IsTerminal, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
@@ -26,6 +28,34 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
+
+macro_rules! statusln {
+    ($($arg:tt)*) => {
+        write_output_line(format_args!($($arg)*))
+    };
+}
+
+fn write_output_line(args: fmt::Arguments<'_>) {
+    write_output_text(&format!("{args}\n"));
+}
+
+fn write_output_block(text: &str) {
+    let mut text = text.to_string();
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    write_output_text(&text);
+}
+
+fn write_output_text(text: &str) {
+    let mut stdout = io::stdout().lock();
+    if io::stdout().is_terminal() {
+        let _ = stdout.write_all(text.replace('\n', "\r\n").as_bytes());
+    } else {
+        let _ = stdout.write_all(text.as_bytes());
+    }
+    let _ = stdout.flush();
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -213,7 +243,7 @@ fn main() -> Result<()> {
     let voxl_discovery = discover_voxl_baseline(&args, &px4_source)?;
     print_voxl_discovery_result(voxl_discovery.as_ref());
 
-    println!("connecting: {connect}");
+    statusln!("connecting: {connect}");
     let mut conn =
         open_transport(&connect).with_context(|| format!("failed to connect to {connect}"))?;
 
@@ -233,7 +263,7 @@ fn main() -> Result<()> {
         &identity,
         Duration::from_secs(args.param_timeout),
     )?;
-    println!("received {} parameters", params.len());
+    statusln!("received {} parameters", params.len());
 
     let wanted_params: HashSet<String> = params.keys().cloned().collect();
     let firmware_defaults = load_firmware_defaults(&px4_source, &wanted_params)?;
@@ -290,20 +320,20 @@ fn main() -> Result<()> {
         &recommendations,
         Some(integer_encoding),
     );
-    println!("MAVLink integer parameter encoding: {integer_encoding:?}");
+    statusln!("MAVLink integer parameter encoding: {integer_encoding:?}");
     let baseline_line = baseline_status_line(
         device_sys_autostart,
         args.sys_autostart,
         &px4_source,
         fallback_reason.as_deref(),
     )?;
-    println!("{baseline_line}");
+    statusln!("{baseline_line}");
     let voxl_lines = voxl_status_lines(voxl_discovery.as_ref());
     for line in &voxl_lines {
-        println!("{line}");
+        statusln!("{line}");
     }
     let px4_source_line = px4_source_status_line(&px4_source);
-    println!("{px4_source_line}");
+    statusln!("{px4_source_line}");
     let mut tui_context_lines = vec![
         format!("MAVLink integer encoding: {integer_encoding:?}"),
         baseline_line,
@@ -321,12 +351,12 @@ fn main() -> Result<()> {
             writes,
             Duration::from_secs(args.write_timeout),
         )?;
-        println!("writes complete");
+        statusln!("writes complete");
         return Ok(());
     }
 
     if args.verbose {
-        println!("\nPX4 source: {}", px4_source.display());
+        write_output_block(&format!("\nPX4 source: {}", px4_source.display()));
     }
 
     if args.plain || !io::stdout().is_terminal() {
@@ -500,12 +530,12 @@ fn discover_voxl_baseline(args: &Args, px4_source: &Path) -> Result<Option<VoxlD
 
 fn print_voxl_discovery_start(args: &Args) {
     match (args.voxl_ssh.as_deref(), args.voxl_adb.as_ref()) {
-        (Some(target), None) => println!("VOXL discovery: probing ssh:{target}"),
+        (Some(target), None) => statusln!("VOXL discovery: probing ssh:{target}"),
         (None, Some(Some(serial))) if !serial.is_empty() => {
-            println!("VOXL discovery: probing adb:{serial}")
+            statusln!("VOXL discovery: probing adb:{serial}")
         }
-        (None, Some(_)) => println!("VOXL discovery: probing adb"),
-        (None, None) => println!("VOXL discovery: disabled (generic PX4 baseline mode)"),
+        (None, Some(_)) => statusln!("VOXL discovery: probing adb"),
+        (None, None) => statusln!("VOXL discovery: disabled (generic PX4 baseline mode)"),
         (Some(_), Some(_)) => {}
     }
 }
@@ -513,7 +543,7 @@ fn print_voxl_discovery_start(args: &Args) {
 fn print_voxl_discovery_result(discovery: Option<&VoxlDiscovery>) {
     if let Some(discovery) = discovery {
         let hostname = discovery.hostname.as_deref().unwrap_or("unknown");
-        println!(
+        statusln!(
             "VOXL discovery: found hostname={} sku={} platform={} params_tree={} stack_files={} platform_file={}",
             hostname,
             discovery.sku,
@@ -919,7 +949,7 @@ fn fallback_serial_paths() -> Vec<String> {
 fn print_serial_ports() -> Result<()> {
     let ports = serialport::available_ports().context("failed to list serial ports")?;
     if ports.is_empty() {
-        println!("no serial ports detected");
+        statusln!("no serial ports detected");
         return Ok(());
     }
 
@@ -927,7 +957,7 @@ fn print_serial_ports() -> Result<()> {
         let score = score_serial_port(&port);
         match port.port_type {
             SerialPortType::UsbPort(usb) => {
-                println!(
+                statusln!(
                     "{} score={} usb vid={:#06x} pid={:#06x} manufacturer={} product={} serial={}",
                     port.port_name,
                     score,
@@ -938,7 +968,7 @@ fn print_serial_ports() -> Result<()> {
                     usb.serial_number.as_deref().unwrap_or("-"),
                 );
             }
-            other => println!("{} score={} {:?}", port.port_name, score, other),
+            other => statusln!("{} score={} {:?}", port.port_name, score, other),
         }
     }
     Ok(())
@@ -1547,11 +1577,15 @@ fn parse_write_value(value: &str) -> Result<f32> {
 }
 
 fn confirm_writes(writes: &[WriteRequest], yes: bool) -> Result<()> {
-    println!("planned writes:");
+    statusln!("planned writes:");
     for write in writes {
-        println!(
+        statusln!(
             "  {} = {} ({:?}, {:?}, {})",
-            write.name, write.value, write.mav_type, write.encoding, write.source
+            write.name,
+            write.value,
+            write.mav_type,
+            write.encoding,
+            write.source
         );
     }
 
@@ -1564,11 +1598,10 @@ fn confirm_writes(writes: &[WriteRequest], yes: bool) -> Result<()> {
         "refusing to prompt on non-interactive stdin; pass --yes to confirm writes"
     );
 
-    print!(
+    write_output_text(&format!(
         "write {} parameter(s) to PX4? Type 'yes' to continue: ",
         writes.len()
-    );
-    io::stdout().flush()?;
+    ));
     let mut answer = String::new();
     io::stdin().read_line(&mut answer)?;
     ensure!(answer.trim() == "yes", "write cancelled");
@@ -1585,7 +1618,7 @@ fn apply_writes(
         send_param_set(conn, identity, &write)?;
         let confirmed = wait_for_param_confirmation(conn, &write.name, timeout, write.encoding)
             .with_context(|| format!("PX4 did not confirm {}", write.name))?;
-        println!("set {} = {}", write.name, format_param(&confirmed));
+        statusln!("set {} = {}", write.name, format_param(&confirmed));
     }
     Ok(())
 }
@@ -1635,12 +1668,15 @@ fn wait_for_param_confirmation(
 }
 
 fn print_identity(identity: &VehicleIdentity) {
-    println!(
+    statusln!(
         "vehicle: sys={} comp={} autopilot={:?} mav_type={:?}",
-        identity.system_id, identity.component_id, identity.autopilot, identity.mav_type
+        identity.system_id,
+        identity.component_id,
+        identity.autopilot,
+        identity.mav_type
     );
     if let Some(version) = &identity.version {
-        println!(
+        statusln!(
             "px4 version: {} board={} vendor={} product={} git={}",
             format_px4_version(version.flight_sw_version),
             version.board_version,
@@ -1649,7 +1685,7 @@ fn print_identity(identity: &VehicleIdentity) {
             format_hash(&version.flight_custom_version),
         );
     } else {
-        println!("px4 version: unavailable via AUTOPILOT_VERSION");
+        statusln!("px4 version: unavailable via AUTOPILOT_VERSION");
     }
 }
 
@@ -2648,7 +2684,7 @@ fn print_audit_table(rows: &[AuditRow]) {
         ]);
     }
 
-    println!("\n{table}");
+    write_output_block(&format!("\n{table}"));
 }
 
 struct TuiApp {
@@ -2881,10 +2917,8 @@ fn run_tui(
     context_lines: Vec<String>,
     write_timeout: Duration,
 ) -> Result<()> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
+    let _guard = TuiTerminalGuard::enter()?;
+    let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
     let result = run_tui_loop(
         &mut terminal,
@@ -2893,10 +2927,30 @@ fn run_tui(
         TuiApp::new(rows, context_lines),
         write_timeout,
     );
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     result
+}
+
+struct TuiTerminalGuard;
+
+impl TuiTerminalGuard {
+    fn enter() -> Result<Self> {
+        enable_raw_mode()?;
+        let mut stdout = io::stdout();
+        if let Err(err) = execute!(stdout, EnterAlternateScreen) {
+            let _ = disable_raw_mode();
+            return Err(err.into());
+        }
+        Ok(Self)
+    }
+}
+
+impl Drop for TuiTerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let mut stdout = io::stdout();
+        let _ = execute!(stdout, LeaveAlternateScreen, Show);
+    }
 }
 
 fn run_tui_loop(

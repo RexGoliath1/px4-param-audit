@@ -270,6 +270,12 @@ If QGroundControl or another process is already bound to `14550`, configure a
 second VOXL GCS endpoint or use a MAVLink router/proxy so each program has its
 own local UDP port.
 
+For another computer, the same split applies: SSH or ADB only discovers the
+VOXL baseline, while MAVLink must be sent to the computer running this tool.
+Update `primary_static_gcs_ip` or `secondary_static_gcs_ip` in
+`voxl-mavlink-server.conf` to that computer's IP, or route MAVLink to it with a
+router/proxy.
+
 If `--connect` is omitted, the tool autodiscovers a PX4/Pixhawk USB serial
 port and uses baud `57600`.
 
