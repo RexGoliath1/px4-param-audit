@@ -41,6 +41,18 @@ struct Args {
     #[arg(long)]
     px4_source: Option<PathBuf>,
 
+    /// SSH target for VOXL-specific baseline discovery, for example root@100.116.80.54.
+    #[arg(long)]
+    voxl_ssh: Option<String>,
+
+    /// Discover VOXL-specific baseline data over ADB. Optionally pass an ADB serial.
+    #[arg(long, num_args = 0..=1, default_missing_value = "", value_name = "SERIAL")]
+    voxl_adb: Option<Option<String>>,
+
+    /// voxl-px4-params checkout used for VOXL platform baseline defaults.
+    #[arg(long)]
+    voxl_params_source: Option<PathBuf>,
+
     /// Compare against this PX4 airframe ID instead of the device SYS_AUTOSTART.
     #[arg(long)]
     sys_autostart: Option<i32>,
@@ -94,6 +106,13 @@ enum ParamEncoding {
 #[derive(Debug, Clone)]
 struct Recommendation {
     value: String,
+    source: String,
+    fallback: bool,
+}
+
+#[derive(Debug, Clone)]
+struct BaselineLayer {
+    defaults: HashMap<String, String>,
     source: String,
     fallback: bool,
 }
@@ -155,6 +174,29 @@ struct VehicleIdentity {
     version: Option<common::AUTOPILOT_VERSION_DATA>,
 }
 
+#[derive(Debug, Clone)]
+struct VoxlDiscovery {
+    transport: String,
+    hostname: Option<String>,
+    sku: String,
+    platform_code: String,
+    px4_package: Option<String>,
+    params_package: Option<String>,
+    params_tree: String,
+    params_source: PathBuf,
+    platform_key: Option<String>,
+    platform_file: PathBuf,
+    param_files: Vec<PathBuf>,
+    local_px4_package: Option<LocalRepoVersion>,
+    local_params_package: Option<LocalRepoVersion>,
+}
+
+#[derive(Debug, Clone)]
+struct LocalRepoVersion {
+    version: String,
+    git: String,
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     if args.list_ports {
@@ -166,7 +208,10 @@ fn main() -> Result<()> {
         Some(connect) => connect,
         None => default_connection()?,
     };
-    let px4_source = resolve_px4_source(args.px4_source.as_deref())?;
+    let px4_source = resolve_px4_source(&args)?;
+    print_voxl_discovery_start(&args);
+    let voxl_discovery = discover_voxl_baseline(&args, &px4_source)?;
+    print_voxl_discovery_result(voxl_discovery.as_ref());
 
     println!("connecting: {connect}");
     let mut conn =
@@ -193,9 +238,16 @@ fn main() -> Result<()> {
     let wanted_params: HashSet<String> = params.keys().cloned().collect();
     let firmware_defaults = load_firmware_defaults(&px4_source, &wanted_params)?;
     let serial_port_indexes = load_serial_port_indexes(&px4_source)?;
+    let voxl_layers = voxl_discovery
+        .as_ref()
+        .map(|discovery| load_voxl_param_layers(discovery, &wanted_params))
+        .transpose()?
+        .unwrap_or_default();
+    let encoding_layers = voxl_layers.clone();
     let encoding_recommendations = build_recommendations(
         firmware_defaults.defaults.clone(),
         HashMap::new(),
+        &encoding_layers,
         &firmware_defaults.serial_config_params,
         &serial_port_indexes,
         None,
@@ -227,6 +279,7 @@ fn main() -> Result<()> {
     let recommendations = build_recommendations(
         firmware_defaults.defaults.clone(),
         final_airframe_defaults,
+        &voxl_layers,
         &firmware_defaults.serial_config_params,
         &serial_port_indexes,
         fallback_reason.as_deref(),
@@ -238,13 +291,25 @@ fn main() -> Result<()> {
         Some(integer_encoding),
     );
     println!("MAVLink integer parameter encoding: {integer_encoding:?}");
-    print_baseline(
+    let baseline_line = baseline_status_line(
         device_sys_autostart,
         args.sys_autostart,
         &px4_source,
         fallback_reason.as_deref(),
     )?;
-    print_px4_source(&px4_source);
+    println!("{baseline_line}");
+    let voxl_lines = voxl_status_lines(voxl_discovery.as_ref());
+    for line in &voxl_lines {
+        println!("{line}");
+    }
+    let px4_source_line = px4_source_status_line(&px4_source);
+    println!("{px4_source_line}");
+    let mut tui_context_lines = vec![
+        format!("MAVLink integer encoding: {integer_encoding:?}"),
+        baseline_line,
+    ];
+    tui_context_lines.extend(voxl_lines);
+    tui_context_lines.push(px4_source_line);
     let rows = build_audit_rows(&params, &recommendations, &firmware_defaults.metadata);
 
     if args.write_diffs || !args.set_params.is_empty() {
@@ -271,6 +336,7 @@ fn main() -> Result<()> {
             &mut *conn,
             &identity,
             rows,
+            tui_context_lines,
             Duration::from_secs(args.write_timeout),
         )?;
     }
@@ -279,6 +345,30 @@ fn main() -> Result<()> {
 }
 
 const DEFAULT_BAUD: u32 = 57600;
+const DEFAULT_VOXL_PX4_SOURCE: &str = "vendor/voxl-px4/px4-firmware";
+const DEFAULT_VOXL_PARAMS_SOURCE: &str = "vendor/voxl-px4-params";
+const VOXL_DISCOVERY_SCRIPT: &str = r#"hostname 2>/dev/null | sed 's/^/hostname=/'
+if [ -f /data/modalai/sku.txt ]; then sed 's/^/sku=/' /data/modalai/sku.txt; fi
+voxl-version 2>/dev/null | awk '$1=="voxl-px4"{print "voxl_px4="$2} $1=="voxl-px4-params"{print "voxl_px4_params="$2}'
+for d in /usr/share/modalai/px4_params/v*; do [ -d "$d" ] && basename "$d" | sed 's/^/param_tree=/'; done
+if command -v voxl-configure-px4-params >/dev/null 2>&1; then python3 - <<'PY' 2>/dev/null
+import ast
+import re
+
+script = open('/usr/bin/voxl-configure-px4-params', encoding='utf-8').read()
+sku = open('/data/modalai/sku.txt', encoding='utf-8').read().strip()
+match = re.search(r'PLATFORM_DIC\s*=\s*(\{.*?\n\})\n\nCAL_PARAMS_PATH', script, re.S)
+if match:
+    platform_dic = ast.literal_eval(match.group(1))
+    for key in sorted(platform_dic, key=len, reverse=True):
+        if sku.startswith(key):
+            print(f'platform_key={key}')
+            for path in platform_dic[key]:
+                print(f'param_file={path}')
+            break
+PY
+fi
+"#;
 
 fn default_connection() -> Result<String> {
     if let Some(port) = discover_px4_serial_port()? {
@@ -294,9 +384,21 @@ fn default_connection() -> Result<String> {
     bail!("could not autodiscover a PX4 USB serial port; pass --connect or run --list-ports")
 }
 
-fn resolve_px4_source(explicit: Option<&Path>) -> Result<PathBuf> {
-    if let Some(path) = explicit {
+fn resolve_px4_source(args: &Args) -> Result<PathBuf> {
+    if let Some(path) = args.px4_source.as_deref() {
         return validate_px4_source(path);
+    }
+
+    if args.voxl_requested() {
+        let default_voxl_source = PathBuf::from(DEFAULT_VOXL_PX4_SOURCE);
+        if default_voxl_source.exists() {
+            return validate_px4_source(&default_voxl_source);
+        }
+        let manifest_voxl_source =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(DEFAULT_VOXL_PX4_SOURCE);
+        if manifest_voxl_source.exists() {
+            return validate_px4_source(&manifest_voxl_source);
+        }
     }
 
     if let Ok(path) = std::env::var("PX4_PARAM_AUDIT_PX4_SOURCE") {
@@ -317,6 +419,387 @@ fn resolve_px4_source(explicit: Option<&Path>) -> Result<PathBuf> {
     )
 }
 
+impl Args {
+    fn voxl_requested(&self) -> bool {
+        self.voxl_ssh.is_some() || self.voxl_adb.is_some()
+    }
+}
+
+fn discover_voxl_baseline(args: &Args, px4_source: &Path) -> Result<Option<VoxlDiscovery>> {
+    if args.voxl_ssh.is_some() && args.voxl_adb.is_some() {
+        bail!("pass only one of --voxl-ssh or --voxl-adb");
+    }
+
+    let Some((transport, text)) = run_voxl_discovery(args)? else {
+        return Ok(None);
+    };
+    let fields = parse_key_value_lines(&text);
+    let sku = fields
+        .get("sku")
+        .cloned()
+        .filter(|value| !value.is_empty())
+        .context("VOXL discovery did not report /data/modalai/sku.txt")?;
+    let platform_code = extract_modalai_platform_code(&sku)
+        .with_context(|| format!("could not derive ModalAI platform code from SKU {sku:?}"))?;
+    let px4_package = fields.get("voxl_px4").cloned();
+    let params_package = fields.get("voxl_px4_params").cloned();
+    let param_trees = fields
+        .get("param_tree")
+        .into_iter()
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let params_tree = derive_voxl_params_tree(px4_package.as_deref(), &param_trees)?;
+    let params_source = resolve_voxl_params_source(args.voxl_params_source.as_deref())?;
+    let platform_key = fields.get("platform_key").cloned();
+    let discovered_param_files = fields
+        .get("param_file")
+        .into_iter()
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let param_files = resolve_voxl_param_stack(
+        &params_source,
+        &params_tree,
+        &platform_code,
+        &discovered_param_files,
+    )?;
+    let platform_file = param_files
+        .iter()
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(&platform_code))
+        })
+        .cloned()
+        .unwrap_or_else(|| param_files[0].clone());
+    let local_px4_package = infer_voxl_wrapper_source(px4_source)
+        .and_then(|path| local_repo_version(&path, px4_package.as_deref()));
+    let local_params_package = local_repo_version(&params_source, params_package.as_deref());
+
+    Ok(Some(VoxlDiscovery {
+        transport,
+        hostname: fields.get("hostname").cloned(),
+        sku,
+        platform_code,
+        px4_package,
+        params_package,
+        params_tree,
+        params_source,
+        platform_key,
+        platform_file,
+        param_files,
+        local_px4_package,
+        local_params_package,
+    }))
+}
+
+fn print_voxl_discovery_start(args: &Args) {
+    match (args.voxl_ssh.as_deref(), args.voxl_adb.as_ref()) {
+        (Some(target), None) => println!("VOXL discovery: probing ssh:{target}"),
+        (None, Some(Some(serial))) if !serial.is_empty() => {
+            println!("VOXL discovery: probing adb:{serial}")
+        }
+        (None, Some(_)) => println!("VOXL discovery: probing adb"),
+        (None, None) => println!("VOXL discovery: disabled (generic PX4 baseline mode)"),
+        (Some(_), Some(_)) => {}
+    }
+}
+
+fn print_voxl_discovery_result(discovery: Option<&VoxlDiscovery>) {
+    if let Some(discovery) = discovery {
+        let hostname = discovery.hostname.as_deref().unwrap_or("unknown");
+        println!(
+            "VOXL discovery: found hostname={} sku={} platform={} params_tree={} stack_files={} platform_file={}",
+            hostname,
+            discovery.sku,
+            discovery.platform_code,
+            discovery.params_tree,
+            discovery.param_files.len(),
+            discovery.platform_file.display()
+        );
+    }
+}
+
+fn run_voxl_discovery(args: &Args) -> Result<Option<(String, String)>> {
+    if let Some(target) = args.voxl_ssh.as_deref() {
+        let output = Command::new("ssh")
+            .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=8", target])
+            .arg(VOXL_DISCOVERY_SCRIPT)
+            .output()
+            .with_context(|| format!("failed to run VOXL SSH discovery against {target}"))?;
+        ensure!(
+            output.status.success(),
+            "VOXL SSH discovery failed for {target}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        return Ok(Some((
+            format!("ssh:{target}"),
+            String::from_utf8_lossy(&output.stdout).to_string(),
+        )));
+    }
+
+    if let Some(adb_serial) = args.voxl_adb.as_ref() {
+        let mut command = Command::new("adb");
+        if let Some(serial) = adb_serial.as_deref().filter(|serial| !serial.is_empty()) {
+            command.args(["-s", serial]);
+        }
+        let output = command
+            .args(["shell", VOXL_DISCOVERY_SCRIPT])
+            .output()
+            .context("failed to run VOXL ADB discovery")?;
+        ensure!(
+            output.status.success(),
+            "VOXL ADB discovery failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        let transport = adb_serial
+            .as_deref()
+            .filter(|serial| !serial.is_empty())
+            .map(|serial| format!("adb:{serial}"))
+            .unwrap_or_else(|| "adb".into());
+        return Ok(Some((
+            transport,
+            String::from_utf8_lossy(&output.stdout).to_string(),
+        )));
+    }
+
+    Ok(None)
+}
+
+fn parse_key_value_lines(text: &str) -> HashMap<String, String> {
+    let mut fields: HashMap<String, String> = HashMap::new();
+    for line in text.lines() {
+        let Some((key, value)) = line.trim().trim_end_matches('\r').split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        fields
+            .entry(key.trim().to_string())
+            .and_modify(|existing| {
+                existing.push(',');
+                existing.push_str(value);
+            })
+            .or_insert_with(|| value.to_string());
+    }
+    fields
+}
+
+fn extract_modalai_platform_code(sku: &str) -> Option<String> {
+    let bytes = sku.as_bytes();
+    bytes.windows(5).find_map(|window| {
+        (window[0] == b'D' && window[1..].iter().all(u8::is_ascii_digit))
+            .then(|| String::from_utf8_lossy(window).to_string())
+    })
+}
+
+fn derive_voxl_params_tree(px4_package: Option<&str>, param_trees: &[String]) -> Result<String> {
+    if let Some(package) = px4_package {
+        let version = package.split('-').next().unwrap_or(package);
+        let parts = version.split('.').collect::<Vec<_>>();
+        if parts.len() >= 2
+            && parts[0].chars().all(|c| c.is_ascii_digit())
+            && parts[1].chars().all(|c| c.is_ascii_digit())
+        {
+            let candidate = format!("v{}.{}", parts[0], parts[1]);
+            if param_trees.is_empty() || param_trees.iter().any(|tree| tree == &candidate) {
+                return Ok(candidate);
+            }
+        }
+    }
+
+    let mut trees = param_trees.to_vec();
+    trees.sort();
+    trees
+        .pop()
+        .context("VOXL discovery did not report any installed px4_params version directories")
+}
+
+fn resolve_voxl_params_source(explicit: Option<&Path>) -> Result<PathBuf> {
+    if let Some(path) = explicit {
+        return validate_voxl_params_source(path);
+    }
+
+    for candidate in [
+        PathBuf::from(DEFAULT_VOXL_PARAMS_SOURCE),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(DEFAULT_VOXL_PARAMS_SOURCE),
+    ] {
+        if candidate.exists() {
+            return validate_voxl_params_source(&candidate);
+        }
+    }
+
+    bail!(
+        "could not find voxl-px4-params source; initialize vendor/voxl-px4-params or pass --voxl-params-source"
+    )
+}
+
+fn validate_voxl_params_source(path: &Path) -> Result<PathBuf> {
+    ensure!(
+        path.join("params").is_dir(),
+        "{} does not look like a voxl-px4-params checkout",
+        path.display()
+    );
+    Ok(path.to_path_buf())
+}
+
+fn find_voxl_platform_file(
+    params_source: &Path,
+    params_tree: &str,
+    platform_code: &str,
+) -> Result<PathBuf> {
+    let dir = params_source
+        .join("params")
+        .join(params_tree)
+        .join("platforms");
+    ensure!(
+        dir.is_dir(),
+        "VOXL params tree {} was not found under {}",
+        params_tree,
+        params_source.display()
+    );
+
+    let mut matches = fs::read_dir(&dir)?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "params"))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(platform_code))
+        })
+        .collect::<Vec<_>>();
+    matches.sort();
+
+    match matches.len() {
+        0 => bail!(
+            "no VOXL platform params file matching {} in {}",
+            platform_code,
+            dir.display()
+        ),
+        1 => Ok(matches.remove(0)),
+        _ => bail!(
+            "multiple VOXL platform params files match {} in {}: {}",
+            platform_code,
+            dir.display(),
+            matches
+                .iter()
+                .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+fn resolve_voxl_param_stack(
+    params_source: &Path,
+    params_tree: &str,
+    platform_code: &str,
+    discovered_param_files: &[String],
+) -> Result<Vec<PathBuf>> {
+    if !discovered_param_files.is_empty() {
+        let mut paths = Vec::new();
+        for relative in discovered_param_files {
+            let path = params_source
+                .join("params")
+                .join(params_tree)
+                .join(relative);
+            ensure!(
+                path.is_file(),
+                "VOXL discovered params file {} was not found in local source",
+                path.display()
+            );
+            paths.push(path);
+        }
+        return Ok(paths);
+    }
+
+    Ok(vec![find_voxl_platform_file(
+        params_source,
+        params_tree,
+        platform_code,
+    )?])
+}
+
+fn infer_voxl_wrapper_source(px4_source: &Path) -> Option<PathBuf> {
+    if px4_source.file_name().and_then(|name| name.to_str()) == Some("px4-firmware") {
+        let parent = px4_source.parent()?;
+        if parent.join(".git").exists() || parent.join(".gitmodules").exists() {
+            return Some(parent.to_path_buf());
+        }
+    }
+
+    let default = PathBuf::from(DEFAULT_VOXL_PX4_SOURCE);
+    default.parent().and_then(|parent| {
+        (parent.join(".git").exists() || parent.join(".gitmodules").exists())
+            .then(|| parent.to_path_buf())
+    })
+}
+
+fn local_repo_version(
+    path: &Path,
+    preferred_remote_version: Option<&str>,
+) -> Option<LocalRepoVersion> {
+    let git = git_output(path, &["rev-parse", "--short", "HEAD"])?;
+    let tags = git_output(path, &["tag", "--points-at", "HEAD"])
+        .unwrap_or_default()
+        .lines()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let version = choose_local_version(&tags, preferred_remote_version)
+        .or_else(|| git_output(path, &["describe", "--tags", "--always", "--dirty"]))
+        .unwrap_or_else(|| git.clone());
+
+    Some(LocalRepoVersion { version, git })
+}
+
+fn git_output(path: &Path, args: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(args)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn choose_local_version(tags: &[String], preferred_remote_version: Option<&str>) -> Option<String> {
+    if let Some(preferred) = preferred_remote_version {
+        if let Some(tag) = tags
+            .iter()
+            .find(|tag| versions_match(Some(preferred), Some(tag.as_str())))
+        {
+            return Some(tag.clone());
+        }
+    }
+
+    tags.iter()
+        .find(|tag| tag.starts_with('v'))
+        .or_else(|| tags.first())
+        .cloned()
+}
+
+fn versions_match(device: Option<&str>, local: Option<&str>) -> bool {
+    match (device, local) {
+        (Some(device), Some(local)) => normalize_version(device) == normalize_version(local),
+        _ => false,
+    }
+}
+
+fn normalize_version(version: &str) -> &str {
+    version.trim().strip_prefix('v').unwrap_or(version.trim())
+}
+
 fn validate_px4_source(path: &Path) -> Result<PathBuf> {
     let source = path.to_path_buf();
     ensure!(
@@ -327,7 +810,7 @@ fn validate_px4_source(path: &Path) -> Result<PathBuf> {
     Ok(source)
 }
 
-fn print_px4_source(px4_source: &Path) {
+fn px4_source_status_line(px4_source: &Path) -> String {
     let git = Command::new("git")
         .arg("-C")
         .arg(px4_source)
@@ -342,7 +825,7 @@ fn print_px4_source(px4_source: &Path) {
         })
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".into());
-    println!("PX4 baseline source: {} git={git}", px4_source.display());
+    format!("PX4 baseline source: {} git={git}", px4_source.display())
 }
 
 fn discover_px4_serial_port() -> Result<Option<String>> {
@@ -1170,50 +1653,110 @@ fn print_identity(identity: &VehicleIdentity) {
     }
 }
 
-fn print_baseline(
+fn baseline_status_line(
     device_sys_autostart: Option<i32>,
     override_sys_autostart: Option<i32>,
     px4_source: &Path,
     fallback_reason: Option<&str>,
-) -> Result<()> {
+) -> Result<String> {
     if let Some(reason) = fallback_reason {
-        println!(
-            "baseline: QGC-style firmware defaults only; airframe-specific defaults not applied ({reason})"
-        );
-        return Ok(());
+        return Ok(format!(
+            "Baseline: QGC-style firmware defaults only; airframe-specific defaults not applied ({reason})"
+        ));
     }
 
-    match (device_sys_autostart, override_sys_autostart) {
+    Ok(match (device_sys_autostart, override_sys_autostart) {
         (Some(device), Some(override_id)) if device != override_id => {
-            println!(
-                "baseline: PX4 airframe {override_id} ({}) via --sys-autostart; device SYS_AUTOSTART={device}",
+            format!(
+                "Baseline: PX4 airframe {override_id} ({}) via --sys-autostart; device SYS_AUTOSTART={device}",
                 airframe_name(px4_source, override_id)?
                     .unwrap_or_else(|| "unknown airframe".into())
-            );
+            )
         }
         (_, Some(override_id)) => {
-            println!(
-                "baseline: PX4 airframe {override_id} ({}) via --sys-autostart",
+            format!(
+                "Baseline: PX4 airframe {override_id} ({}) via --sys-autostart",
                 airframe_name(px4_source, override_id)?
                     .unwrap_or_else(|| "unknown airframe".into())
-            );
+            )
         }
         (Some(device), None) if device != 0 => {
-            println!(
-                "baseline: PX4 airframe {device} ({}) from device SYS_AUTOSTART",
+            format!(
+                "Baseline: PX4 airframe {device} ({}) from device SYS_AUTOSTART",
                 airframe_name(px4_source, device)?.unwrap_or_else(|| "unknown airframe".into())
-            );
+            )
         }
-        (Some(device), None) => {
-            println!(
-                "baseline: firmware defaults only; device SYS_AUTOSTART={device} does not select an airframe"
-            );
-        }
+        (Some(device), None) => format!(
+            "Baseline: firmware defaults only; device SYS_AUTOSTART={device} does not select an airframe"
+        ),
         (None, None) => {
-            println!("baseline: firmware defaults only; device SYS_AUTOSTART was not received");
+            "Baseline: firmware defaults only; device SYS_AUTOSTART was not received".into()
         }
-    }
-    Ok(())
+    })
+}
+
+fn voxl_status_lines(discovery: Option<&VoxlDiscovery>) -> Vec<String> {
+    let Some(discovery) = discovery else {
+        return vec!["VOXL discovery: disabled; using generic PX4 baseline sources".into()];
+    };
+    let hostname = discovery.hostname.as_deref().unwrap_or("unknown");
+    let platform_key = discovery.platform_key.as_deref().unwrap_or("unknown");
+    let platform_file = discovery
+        .platform_file
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("unknown");
+    vec![
+        format!(
+            "VOXL: {} host={} sku={} platform={} key={} tree={}",
+            discovery.transport,
+            hostname,
+            discovery.sku,
+            discovery.platform_code,
+            platform_key,
+            discovery.params_tree
+        ),
+        format!(
+            "VOXL params: {} file(s); platform source={}",
+            discovery.param_files.len(),
+            platform_file,
+        ),
+        voxl_version_status_line(
+            "voxl-px4",
+            discovery.px4_package.as_deref(),
+            discovery.local_px4_package.as_ref(),
+        ),
+        voxl_version_status_line(
+            "voxl-px4-params",
+            discovery.params_package.as_deref(),
+            discovery.local_params_package.as_ref(),
+        ),
+    ]
+}
+
+fn voxl_version_status_line(
+    name: &str,
+    device_version: Option<&str>,
+    local: Option<&LocalRepoVersion>,
+) -> String {
+    let device = device_version.unwrap_or("unknown");
+    let local_version = local
+        .map(|version| version.version.as_str())
+        .unwrap_or("unknown");
+    let status = if versions_match(
+        device_version,
+        local.map(|version| version.version.as_str()),
+    ) {
+        "match"
+    } else if device_version.is_some() && local.is_some() {
+        "mismatch"
+    } else {
+        "unknown"
+    };
+    let local_git = local
+        .map(|version| version.git.as_str())
+        .unwrap_or("unknown");
+    format!("{name}: status={status} device={device} local={local_version} git={local_git}")
 }
 
 fn decoded_sys_autostart(params: &HashMap<String, ParamValue>) -> Option<i32> {
@@ -1284,6 +1827,11 @@ fn load_firmware_defaults(px4_source: &Path, wanted: &HashSet<String>) -> Result
     let mut metadata = HashMap::new();
     let mut serial_config_params = HashSet::new();
     let src = px4_source.join("src");
+    visit_param_source_files(&src, &mut |path| {
+        if let Ok(text) = fs::read_to_string(path) {
+            collect_c_param_data(&text, wanted, &mut defaults, &mut metadata);
+        }
+    })?;
     visit_yaml_files(&src, &mut |path| {
         if let Ok(text) = fs::read_to_string(path) {
             if let Ok(yaml) = serde_yaml::from_str::<Value>(&text) {
@@ -1302,6 +1850,25 @@ fn load_firmware_defaults(px4_source: &Path, wanted: &HashSet<String>) -> Result
         metadata,
         serial_config_params,
     })
+}
+
+fn visit_param_source_files(dir: &Path, f: &mut dyn FnMut(&Path)) -> Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            visit_param_source_files(&path, f)?;
+        } else if path
+            .extension()
+            .is_some_and(|ext| matches!(ext.to_str(), Some("c" | "cc" | "cpp" | "h" | "hpp")))
+        {
+            f(&path);
+        }
+    }
+    Ok(())
 }
 
 fn visit_yaml_files(dir: &Path, f: &mut dyn FnMut(&Path)) -> Result<()> {
@@ -1446,6 +2013,151 @@ fn yaml_scalar_to_string(value: &Value) -> String {
     }
 }
 
+fn collect_c_param_data(
+    text: &str,
+    wanted: &HashSet<String>,
+    defaults: &mut HashMap<String, String>,
+    metadata: &mut HashMap<String, ParamMetadata>,
+) {
+    let mut in_comment = false;
+    let mut comment = Vec::new();
+    let mut pending_comment = Vec::new();
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("/**") {
+            in_comment = true;
+            comment.clear();
+            let rest = trimmed.trim_start_matches("/**").trim();
+            if !rest.is_empty() && rest != "*/" {
+                comment.push(clean_c_comment_line(rest));
+            }
+            if trimmed.ends_with("*/") {
+                in_comment = false;
+                pending_comment = comment.clone();
+            }
+            continue;
+        }
+
+        if in_comment {
+            let ends = trimmed.ends_with("*/");
+            let content = trimmed.trim_end_matches("*/").trim();
+            if !content.is_empty() {
+                comment.push(clean_c_comment_line(content));
+            }
+            if ends {
+                in_comment = false;
+                pending_comment = comment.clone();
+            }
+            continue;
+        }
+
+        if let Some((macro_type, name, default)) = parse_c_param_define(trimmed) {
+            if wanted.contains(&name) {
+                defaults.insert(name.clone(), default);
+                metadata.insert(name, parse_c_param_metadata(&pending_comment, &macro_type));
+            }
+            pending_comment.clear();
+        }
+    }
+}
+
+fn clean_c_comment_line(line: &str) -> String {
+    line.trim().trim_start_matches('*').trim().to_string()
+}
+
+fn parse_c_param_define(line: &str) -> Option<(String, String, String)> {
+    let start = line.find("PARAM_DEFINE_")?;
+    let rest = &line[start + "PARAM_DEFINE_".len()..];
+    let (macro_type, args) = rest.split_once('(')?;
+    let args = args.split_once(')').map(|(args, _)| args)?;
+    let mut parts = args.splitn(3, ',').map(str::trim);
+    let name = parts.next()?.to_string();
+    let default = normalize_c_default_value(parts.next()?);
+    (!name.is_empty()).then(|| (macro_type.to_ascii_lowercase(), name, default))
+}
+
+fn normalize_c_default_value(value: &str) -> String {
+    value
+        .trim()
+        .trim_end_matches(';')
+        .trim_end_matches('f')
+        .trim_end_matches('F')
+        .trim()
+        .to_string()
+}
+
+fn parse_c_param_metadata(comment: &[String], macro_type: &str) -> ParamMetadata {
+    let mut metadata = ParamMetadata {
+        param_type: Some(macro_type.to_string()),
+        ..ParamMetadata::default()
+    };
+    let mut description = Vec::new();
+    let mut seen_tag = false;
+
+    for line in comment {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            if !description.is_empty() && !seen_tag {
+                seen_tag = true;
+            }
+            continue;
+        }
+
+        if let Some(tag) = trimmed.strip_prefix('@') {
+            seen_tag = true;
+            parse_c_param_tag(tag, &mut metadata);
+        } else if !seen_tag {
+            description.push(trimmed.to_string());
+        }
+    }
+
+    if !description.is_empty() {
+        metadata.short_description = Some(description.join(" "));
+    }
+    if !metadata.bits.is_empty() {
+        metadata.param_type = Some("bitmask".into());
+    } else if !metadata.values.is_empty() {
+        metadata.param_type = Some("enum".into());
+    }
+    metadata.bits.sort_by_key(|choice| choice.value);
+    metadata.values.sort_by_key(|choice| choice.value);
+    metadata
+}
+
+fn parse_c_param_tag(tag: &str, metadata: &mut ParamMetadata) {
+    let (name, value) = tag.split_once(char::is_whitespace).unwrap_or((tag, ""));
+    let value = value.trim();
+    match name {
+        "min" => metadata.min = Some(value.to_string()),
+        "max" => metadata.max = Some(value.to_string()),
+        "unit" => metadata.unit = Some(value.to_string()),
+        "decimal" => metadata.decimal = Some(value.to_string()),
+        "reboot_required" => metadata.reboot_required = value == "true",
+        "bit" => {
+            if let Some(choice) = parse_c_param_choice(value) {
+                metadata.bits.push(choice);
+            }
+        }
+        "value" => {
+            if let Some(choice) = parse_c_param_choice(value) {
+                metadata.values.push(choice);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn parse_c_param_choice(value: &str) -> Option<ParamChoice> {
+    let mut parts = value.splitn(2, char::is_whitespace);
+    let choice_value = parts.next()?.parse().ok()?;
+    let label = parts.next().unwrap_or("").trim().to_string();
+    Some(ParamChoice {
+        value: choice_value,
+        label,
+    })
+}
+
 fn load_airframe_defaults(
     px4_source: &Path,
     sys_autostart: i32,
@@ -1461,6 +2173,80 @@ fn load_airframe_defaults(
         defaults.insert("SYS_AUTOSTART".into(), sys_autostart.to_string());
     }
     Ok(defaults)
+}
+
+fn load_voxl_param_layers(
+    discovery: &VoxlDiscovery,
+    wanted: &HashSet<String>,
+) -> Result<Vec<BaselineLayer>> {
+    let mut layers = Vec::new();
+    for path in &discovery.param_files {
+        let defaults = parse_voxl_params_file(path, wanted)?;
+        if defaults.is_empty() {
+            continue;
+        }
+        layers.push(BaselineLayer {
+            defaults,
+            source: format!(
+                "VOXL {} default ({})",
+                discovery.platform_code,
+                voxl_param_stack_label(discovery, path)
+            ),
+            fallback: false,
+        });
+    }
+    ensure!(
+        !layers.is_empty(),
+        "VOXL params stack starting at {} has no defaults matching reported parameters",
+        discovery.platform_file.display()
+    );
+    Ok(layers)
+}
+
+fn voxl_param_stack_label(discovery: &VoxlDiscovery, path: &Path) -> String {
+    path.strip_prefix(
+        discovery
+            .params_source
+            .join("params")
+            .join(&discovery.params_tree),
+    )
+    .ok()
+    .and_then(|path| path.to_str())
+    .map(ToOwned::to_owned)
+    .or_else(|| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .map(ToOwned::to_owned)
+    })
+    .unwrap_or_else(|| "unknown".into())
+}
+
+fn parse_voxl_params_file(
+    path: &Path,
+    wanted: &HashSet<String>,
+) -> Result<HashMap<String, String>> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("failed to read VOXL params file {}", path.display()))?;
+    Ok(parse_voxl_params_text(&text, wanted))
+}
+
+fn parse_voxl_params_text(text: &str, wanted: &HashSet<String>) -> HashMap<String, String> {
+    let mut defaults = HashMap::new();
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let parts = line.split_whitespace().collect::<Vec<_>>();
+        if parts.len() < 5 {
+            continue;
+        }
+        let name = parts[2];
+        if wanted.contains(name) {
+            defaults.insert(name.to_string(), parts[3].to_string());
+        }
+    }
+    defaults
 }
 
 fn find_airframe_script(dir: &Path, sys_autostart: i32) -> Result<Option<PathBuf>> {
@@ -1581,6 +2367,7 @@ fn parse_serial_port_indexes(text: &str) -> HashMap<String, String> {
 fn build_recommendations(
     firmware: HashMap<String, String>,
     airframe: HashMap<String, String>,
+    extra_layers: &[BaselineLayer],
     serial_config_params: &HashSet<String>,
     serial_port_indexes: &HashMap<String, String>,
     fallback_reason: Option<&str>,
@@ -1615,6 +2402,24 @@ fn build_recommendations(
                 fallback: false,
             },
         );
+    }
+    for layer in extra_layers {
+        for (name, value) in &layer.defaults {
+            let (value, label) = normalize_default_value(
+                name,
+                value.clone(),
+                serial_config_params,
+                serial_port_indexes,
+            );
+            out.insert(
+                name.clone(),
+                Recommendation {
+                    value,
+                    source: recommendation_source(&layer.source, label.as_deref()),
+                    fallback: layer.fallback,
+                },
+            );
+        }
     }
     out
 }
@@ -1849,6 +2654,7 @@ fn print_audit_table(rows: &[AuditRow]) {
 struct TuiApp {
     rows: Vec<AuditRow>,
     filtered: Vec<usize>,
+    context_lines: Vec<String>,
     query: String,
     edit_value: String,
     pending_writes: Vec<WriteRequest>,
@@ -1875,11 +2681,12 @@ enum TuiAction {
 }
 
 impl TuiApp {
-    fn new(rows: Vec<AuditRow>) -> Self {
+    fn new(rows: Vec<AuditRow>, context_lines: Vec<String>) -> Self {
         let filtered = (0..rows.len()).collect();
         Self {
             rows,
             filtered,
+            context_lines,
             query: String::new(),
             edit_value: String::new(),
             pending_writes: Vec::new(),
@@ -2071,6 +2878,7 @@ fn run_tui(
     conn: &mut dyn MavTransport,
     identity: &VehicleIdentity,
     rows: Vec<AuditRow>,
+    context_lines: Vec<String>,
     write_timeout: Duration,
 ) -> Result<()> {
     enable_raw_mode()?;
@@ -2082,7 +2890,7 @@ fn run_tui(
         &mut terminal,
         conn,
         identity,
-        TuiApp::new(rows),
+        TuiApp::new(rows, context_lines),
         write_timeout,
     );
     disable_raw_mode()?;
@@ -2341,12 +3149,19 @@ fn handle_key(app: &mut TuiApp, key: KeyEvent) -> TuiAction {
 }
 
 fn draw_tui(frame: &mut ratatui::Frame, app: &TuiApp) {
+    let context_height = if app.context_lines.len() >= 6 {
+        10
+    } else {
+        (app.context_lines.len() as u16 + 2).clamp(3, 6)
+    };
+    let status_height = if context_height >= 10 { 5 } else { 8 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
+            Constraint::Length(context_height),
             Constraint::Min(6),
-            Constraint::Length(8),
+            Constraint::Length(status_height),
         ])
         .split(frame.area());
 
@@ -2378,6 +3193,18 @@ fn draw_tui(frame: &mut ratatui::Frame, app: &TuiApp) {
         .block(Block::default().borders(Borders::ALL).title(input_title))
         .style(input_style);
     frame.render_widget(input, chunks[0]);
+
+    let context = app
+        .context_lines
+        .iter()
+        .map(|line| baseline_context_line(line))
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(context)
+            .block(Block::default().borders(Borders::ALL).title("Baseline"))
+            .wrap(Wrap { trim: false }),
+        chunks[1],
+    );
 
     let rows = app.filtered.iter().filter_map(|index| {
         let row = app.rows.get(*index)?;
@@ -2419,7 +3246,7 @@ fn draw_tui(frame: &mut ratatui::Frame, app: &TuiApp) {
     if !app.filtered.is_empty() {
         state.select(Some(app.selected));
     }
-    frame.render_stateful_widget(table, chunks[1], &mut state);
+    frame.render_stateful_widget(table, chunks[2], &mut state);
 
     let detail = app
         .selected_row()
@@ -2434,12 +3261,25 @@ fn draw_tui(frame: &mut ratatui::Frame, app: &TuiApp) {
 
     frame.render_widget(
         Paragraph::new(detail).block(Block::default().borders(Borders::ALL).title("Status")),
-        chunks[2],
+        chunks[3],
     );
 
     if app.mode == TuiMode::MetadataPopup {
         draw_metadata_popup(frame, app);
     }
+}
+
+fn baseline_context_line(line: &str) -> Line<'static> {
+    let style = if line.contains("status=match") {
+        Style::default().green()
+    } else if line.contains("status=mismatch") {
+        Style::default().red().bold()
+    } else if line.contains("status=unknown") {
+        Style::default().dark_gray()
+    } else {
+        Style::default()
+    };
+    Line::from(Span::styled(line.to_string(), style))
 }
 
 fn draw_metadata_popup(frame: &mut ratatui::Frame, app: &TuiApp) {
@@ -3050,11 +3890,14 @@ parameters:
 
     #[test]
     fn toggles_diff_only_view_with_search_filter() {
-        let mut app = TuiApp::new(vec![
-            test_row("EKF2_GPS_CTRL", "diff"),
-            test_row("EKF2_REQ_EPH", "match"),
-            test_row("GPS_1_CONFIG", "diff"),
-        ]);
+        let mut app = TuiApp::new(
+            vec![
+                test_row("EKF2_GPS_CTRL", "diff"),
+                test_row("EKF2_REQ_EPH", "match"),
+                test_row("GPS_1_CONFIG", "diff"),
+            ],
+            vec!["Baseline: test".into()],
+        );
 
         assert_eq!(app.filtered.len(), 3);
         assert_eq!(app.view_label(), "all params");
@@ -3251,6 +4094,7 @@ parameters:
         let recommendations = build_recommendations(
             HashMap::from([("EKF2_GPS_CTRL".into(), "7".into())]),
             HashMap::new(),
+            &[],
             &HashSet::new(),
             &HashMap::new(),
             Some("SYS_AUTOSTART=0 does not select an airframe"),
@@ -3273,6 +4117,9 @@ parameters:
             &Args {
                 connect: None,
                 px4_source: None,
+                voxl_ssh: None,
+                voxl_adb: None,
+                voxl_params_source: None,
                 sys_autostart: None,
                 param_timeout: 15,
                 verbose: false,
@@ -3293,6 +4140,157 @@ parameters:
                 .to_string()
                 .contains("no writable parameters selected")
         );
+    }
+
+    #[test]
+    fn parses_voxl_params_file_ignoring_commented_defaults() {
+        let text = r#"
+# 1 1 MC_PITCHRATE_D 0.0015 9
+1 1 MC_PITCHRATE_D 0.0011 9
+1 1 SYS_AUTOSTART 4001 6 # inline comment
+"#;
+        let wanted = HashSet::from(["MC_PITCHRATE_D".to_string(), "SYS_AUTOSTART".to_string()]);
+        let defaults = parse_voxl_params_text(text, &wanted);
+
+        assert_eq!(
+            defaults.get("MC_PITCHRATE_D").map(String::as_str),
+            Some("0.0011")
+        );
+        assert_eq!(
+            defaults.get("SYS_AUTOSTART").map(String::as_str),
+            Some("4001")
+        );
+    }
+
+    #[test]
+    fn derives_voxl_platform_baseline_from_starling_sku() {
+        assert_eq!(
+            extract_modalai_platform_code("MRB-D0012-4-V2-C29-T9-M1-X8").as_deref(),
+            Some("D0012")
+        );
+        assert_eq!(
+            derive_voxl_params_tree(Some("1.14.0-2.0.142"), &["v1.14".into(), "v1.18".into()])
+                .as_deref()
+                .expect("params tree"),
+            "v1.14"
+        );
+    }
+
+    #[test]
+    fn voxl_platform_layer_overrides_firmware_default() {
+        let recommendations = build_recommendations(
+            HashMap::from([("MC_PITCHRATE_D".into(), "0.003".into())]),
+            HashMap::new(),
+            &[BaselineLayer {
+                defaults: HashMap::from([("MC_PITCHRATE_D".into(), "0.0011".into())]),
+                source: "VOXL D0012 default (platforms/D0012_Starling_2_Max.params)".into(),
+                fallback: false,
+            }],
+            &HashSet::new(),
+            &HashMap::new(),
+            None,
+        );
+
+        let rec = recommendations
+            .get("MC_PITCHRATE_D")
+            .expect("recommendation");
+        assert_eq!(rec.value, "0.0011");
+        assert_eq!(
+            rec.source,
+            "VOXL D0012 default (platforms/D0012_Starling_2_Max.params)"
+        );
+        assert!(!rec.fallback);
+    }
+
+    #[test]
+    fn voxl_platform_baseline_keeps_px4_bitmask_metadata() {
+        let params = HashMap::from([(
+            "EKF2_GPS_CTRL".into(),
+            ParamValue {
+                value: 7.0,
+                mav_type: common::MavParamType::MAV_PARAM_TYPE_INT32,
+                encoding: ParamEncoding::CCast,
+            },
+        )]);
+        let recommendations = HashMap::from([(
+            "EKF2_GPS_CTRL".into(),
+            Recommendation {
+                value: "7".into(),
+                source: "VOXL D0012 default (EKF2_helpers/vio_gps_baro.params)".into(),
+                fallback: false,
+            },
+        )]);
+        let metadata = HashMap::from([(
+            "EKF2_GPS_CTRL".into(),
+            ParamMetadata {
+                param_type: Some("bitmask".into()),
+                bits: vec![
+                    ParamChoice {
+                        value: 0,
+                        label: "Lon/lat".into(),
+                    },
+                    ParamChoice {
+                        value: 1,
+                        label: "Altitude".into(),
+                    },
+                ],
+                ..ParamMetadata::default()
+            },
+        )]);
+
+        let rows = build_audit_rows(&params, &recommendations, &metadata);
+        let row = rows.first().expect("row");
+
+        assert!(row_has_metadata_choices(row));
+        assert_eq!(
+            metadata_choices_line(row.metadata.as_ref().expect("metadata")).as_deref(),
+            Some("Bits: 0=Lon/lat | 1=Altitude")
+        );
+    }
+
+    #[test]
+    fn parses_px4_c_param_bitmask_metadata() {
+        let text = r#"
+/**
+ * Integer bitmask controlling GPS fusion.
+ *
+ * @group EKF2
+ * @min 0
+ * @max 15
+ * @bit 0 Lon/lat
+ * @bit 1 Altitude
+ * @bit 2 3D velocity
+ * @bit 3 Dual antenna heading
+ */
+PARAM_DEFINE_INT32(EKF2_GPS_CTRL, 7);
+"#;
+        let wanted = HashSet::from(["EKF2_GPS_CTRL".to_string()]);
+        let mut defaults = HashMap::new();
+        let mut metadata = HashMap::new();
+
+        collect_c_param_data(text, &wanted, &mut defaults, &mut metadata);
+
+        assert_eq!(defaults.get("EKF2_GPS_CTRL").map(String::as_str), Some("7"));
+        let metadata = metadata.get("EKF2_GPS_CTRL").expect("metadata");
+        assert_eq!(metadata.param_type.as_deref(), Some("bitmask"));
+        assert_eq!(metadata.min.as_deref(), Some("0"));
+        assert_eq!(metadata.max.as_deref(), Some("15"));
+        assert_eq!(metadata.bits.len(), 4);
+        assert_eq!(metadata.bits[3].label, "Dual antenna heading");
+    }
+
+    #[test]
+    fn reports_voxl_package_version_mismatch() {
+        let local = LocalRepoVersion {
+            version: "v0.9.16".into(),
+            git: "f289135".into(),
+        };
+
+        let line = voxl_version_status_line("voxl-px4-params", Some("0.9.15"), Some(&local));
+
+        assert!(line.contains("device=0.9.15"));
+        assert!(line.contains("local=v0.9.16"));
+        assert!(line.contains("status=mismatch"));
     }
 
     fn test_row(name: &str, status: &str) -> AuditRow {

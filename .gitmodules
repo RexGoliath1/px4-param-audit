@@ -1,3 +1,9 @@
 [submodule "vendor/PX4-Autopilot"]
 	path = vendor/PX4-Autopilot
 	url = https://github.com/PX4/PX4-Autopilot.git
+[submodule "vendor/voxl-px4"]
+	path = vendor/voxl-px4
+	url = https://gitlab.com/voxl-public/voxl-sdk/services/voxl-px4.git
+[submodule "vendor/voxl-px4-params"]
+	path = vendor/voxl-px4-params
+	url = https://gitlab.com/voxl-public/voxl-sdk/utilities/voxl-px4-params.git

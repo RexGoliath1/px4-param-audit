@@ -12,9 +12,11 @@ baseline provider.
 - Reads heartbeat vehicle identity.
 - Requests `AUTOPILOT_VERSION`.
 - Requests the full parameter list.
-- Parses PX4 firmware defaults from the pinned `vendor/PX4-Autopilot`
+- Parses PX4 firmware defaults and metadata from the pinned `vendor/PX4-Autopilot`
   submodule by default.
 - Parses matching airframe defaults from `SYS_AUTOSTART` or `--sys-autostart`.
+- Vendors ModalAI VOXL source and parameter repos for VOXL-specific baseline
+  support without copying their generated defaults into this repository.
 - Opens a scrollable/searchable terminal UI listing every parameter read from
   the device.
 - Can write explicit numeric parameter values when requested.
@@ -29,7 +31,7 @@ Common requirements:
 - Rust toolchain with Cargo. Install with `rustup` unless your package manager
   already provides a current Rust release.
 - `git` and `make`.
-- The `vendor/PX4-Autopilot` submodule, or another PX4 checkout passed with
+- The baseline source submodules, or another PX4 checkout passed with
   `--px4-source`.
 - Access to a MAVLink endpoint: serial, UDP, or TCP.
 
@@ -60,10 +62,14 @@ sudo usermod -aG dialout "$USER"
 
 ## Build
 
-Initialize the pinned PX4 baseline source:
+Initialize the pinned baseline sources:
 
 ```bash
-git submodule update --init --depth 1 vendor/PX4-Autopilot
+git submodule update --init \
+  vendor/PX4-Autopilot \
+  vendor/voxl-px4 \
+  vendor/voxl-px4-params
+git -C vendor/voxl-px4 submodule update --init px4-firmware
 ```
 
 Build a compiled executable:
@@ -109,6 +115,59 @@ make install
 The examples below assume you are running from the repository root after
 `make`, so they use `./px4-param-audit`. If you install the binary onto your
 `PATH`, you can omit the `./` prefix.
+
+## Vendored Baseline Sources
+
+Baseline data is referenced from source repositories at runtime; parameter
+metadata and defaults are not copied into this project.
+
+- `vendor/PX4-Autopilot`: upstream PX4 source. This is the default source for
+  generic MAVLink/Pixhawk use.
+- `vendor/voxl-px4`: ModalAI's VOXL PX4 wrapper. Its nested
+  `px4-firmware` submodule is the PX4 firmware tree to use for VOXL firmware
+  metadata and defaults.
+- `vendor/voxl-px4-params`: ModalAI's platform and helper parameter bundles,
+  including Starling platform files such as
+  `params/v1.14/platforms/D0012_Starling_2_Max.params`.
+
+When `--voxl-ssh` or `--voxl-adb` is supplied, the tool discovers the VOXL
+hostname, SKU, installed `voxl-px4` package, installed `voxl-px4-params`
+package, installed `/usr/share/modalai/px4_params/v*` trees, and the ordered
+parameter stack from `voxl-configure-px4-params`. It then applies that stack on
+top of the PX4 firmware and airframe defaults. This keeps generic PX4
+parameters visible when a VOXL platform file does not override them, while
+preferring ModalAI's platform and helper defaults when they exist.
+
+The selected VOXL platform, params stack size, installed package versions, and
+local vendored source versions are shown in the TUI Baseline panel. Version rows
+are marked `match`, `mismatch`, or `unknown` so it is clear when the drone and
+local sources are not aligned.
+
+For example, a Starling 2 Max with SKU `MRB-D0012-...` and `voxl-px4
+1.14.0-...` can resolve to an ordered stack like:
+
+```text
+params/v1.14/platforms/VOXL_2_defaults.params
+params/v1.14/EKF2_helpers/vio_gps_baro.params
+params/v1.14/platforms/D0012_Starling_2_Max.params
+params/v1.14/EKF2_helpers/exposed_baro.params
+params/v1.14/battery_helpers/Amprius_18650_4s.params
+params/v1.14/other_helpers/starling_2_max_outdoor_position.params
+params/v1.14/radio_helpers/Commando_8.params
+```
+
+MAVLink remains the transport for reading and writing PX4 parameters. SSH or
+ADB is only used for VOXL baseline discovery, so generic MAVLink-only
+PX4/Holybro use does not require SSH or ADB.
+
+To inspect against the ModalAI firmware tree manually without VOXL discovery:
+
+```bash
+./px4-param-audit \
+  --connect udp-listen:0.0.0.0:14550 \
+  --px4-source vendor/voxl-px4/px4-firmware \
+  --sys-autostart 4001
+```
 
 ## Usage
 
@@ -168,19 +227,37 @@ In `voxl-mavlink-server.conf`, `primary_static_gcs_ip` and
 `gcs_port_from_autopilot` is the VOXL-side receive path from PX4; the host
 usually listens on the GCS UDP port shown by `ss`, commonly `14550`.
 
-Find the PX4 airframe ID for baseline comparison:
+Find the PX4 airframe ID if you want to sanity-check the generic PX4 baseline:
 
 ```bash
 adb shell 'px4-param show SYS_AUTOSTART'
 ```
 
 Then run the tool on the host. For example, if VOXL sends GCS MAVLink to this
-computer on UDP `14550` and `SYS_AUTOSTART=4001`:
+computer on UDP `14550` and the VOXL is reachable over SSH:
 
 ```bash
 ./px4-param-audit \
   --connect udp-listen:0.0.0.0:14550 \
-  --sys-autostart 4001 \
+  --voxl-ssh root@100.116.80.54 \
+  --param-timeout 45
+```
+
+If the VOXL is reachable over ADB instead:
+
+```bash
+./px4-param-audit \
+  --connect udp-listen:0.0.0.0:14550 \
+  --voxl-adb \
+  --param-timeout 45
+```
+
+For multiple ADB devices, pass the ADB serial after `--voxl-adb`:
+
+```bash
+./px4-param-audit \
+  --connect udp-listen:0.0.0.0:14550 \
+  --voxl-adb 0123456789abcdef \
   --param-timeout 45
 ```
 
@@ -264,7 +341,7 @@ The TUI can edit or reset device values directly:
 - Press `Esc` to cancel editing.
 
 For parameters with PX4 metadata, the selected-row detail panel shows the
-QGroundControl-style type information from the PX4 YAML metadata. Enum
+QGroundControl-style type information from the selected PX4 source. Enum
 parameters list their numeric values and labels, bitmask parameters list every
 known bit and the active bits for the current value, and boolean parameters show
 the `0=Disabled` / `1=Enabled` mapping.
@@ -338,12 +415,19 @@ device value, PX4 baseline value, source, or status.
 
 ## Baseline Model
 
-The baseline is derived from PX4, not from a hand-written project profile:
+The baseline is derived from PX4 and VOXL source repositories, not from a
+hand-written project profile:
 
 ```text
-PX4 firmware YAML defaults
+PX4 firmware defaults and metadata
 + matching airframe defaults from SYS_AUTOSTART
++ ordered VOXL parameter stack when --voxl-ssh or --voxl-adb is used
 ```
+
+The layers are merged in that order. Generic PX4 firmware defaults fill in
+parameters that the vehicle-specific files do not mention, and later VOXL
+helper/platform files override earlier defaults when ModalAI supplies a more
+specific value.
 
 If `--sys-autostart` is supplied, that airframe ID is used for the comparison
 baseline instead of the device's reported `SYS_AUTOSTART`. Supplying a baseline
