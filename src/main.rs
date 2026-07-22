@@ -95,6 +95,7 @@ enum ParamEncoding {
 struct Recommendation {
     value: String,
     source: String,
+    fallback: bool,
 }
 
 #[derive(Debug)]
@@ -130,6 +131,7 @@ struct AuditRow {
     baseline: String,
     source: String,
     status: String,
+    baseline_fallback: bool,
     mav_type: common::MavParamType,
     encoding: ParamEncoding,
     metadata: Option<ParamMetadata>,
@@ -188,22 +190,15 @@ fn main() -> Result<()> {
     )?;
     println!("received {} parameters", params.len());
 
-    let device_sys_autostart = params.get("SYS_AUTOSTART").map(|p| p.value.round() as i32);
-    let baseline_sys_autostart = args.sys_autostart.or(device_sys_autostart);
     let wanted_params: HashSet<String> = params.keys().cloned().collect();
     let firmware_defaults = load_firmware_defaults(&px4_source, &wanted_params)?;
-    let airframe_defaults = if let Some(id) = baseline_sys_autostart {
-        load_airframe_defaults(&px4_source, id, &wanted_params)?
-    } else {
-        HashMap::new()
-    };
     let serial_port_indexes = load_serial_port_indexes(&px4_source)?;
-
-    let recommendations = build_recommendations(
+    let encoding_recommendations = build_recommendations(
         firmware_defaults.defaults.clone(),
-        airframe_defaults,
+        HashMap::new(),
         &firmware_defaults.serial_config_params,
         &serial_port_indexes,
+        None,
     );
     let preferred_encoding = identity
         .version
@@ -212,11 +207,43 @@ fn main() -> Result<()> {
     let integer_encoding = infer_param_encodings(
         &mut params,
         &firmware_defaults.metadata,
-        &recommendations,
+        &encoding_recommendations,
         preferred_encoding,
     );
+    let device_sys_autostart = decoded_sys_autostart(&params);
+    let baseline_sys_autostart = args.sys_autostart.or(device_sys_autostart);
+    let airframe_defaults = if let Some(id) = baseline_sys_autostart.filter(|id| *id != 0) {
+        load_airframe_defaults(&px4_source, id, &wanted_params)?
+    } else {
+        HashMap::new()
+    };
+    let fallback_reason =
+        baseline_fallback_reason(baseline_sys_autostart, &airframe_defaults, &wanted_params);
+    let final_airframe_defaults = if fallback_reason.is_some() {
+        HashMap::new()
+    } else {
+        airframe_defaults
+    };
+    let recommendations = build_recommendations(
+        firmware_defaults.defaults.clone(),
+        final_airframe_defaults,
+        &firmware_defaults.serial_config_params,
+        &serial_port_indexes,
+        fallback_reason.as_deref(),
+    );
+    infer_param_encodings(
+        &mut params,
+        &firmware_defaults.metadata,
+        &recommendations,
+        Some(integer_encoding),
+    );
     println!("MAVLink integer parameter encoding: {integer_encoding:?}");
-    print_baseline(device_sys_autostart, args.sys_autostart, &px4_source)?;
+    print_baseline(
+        device_sys_autostart,
+        args.sys_autostart,
+        &px4_source,
+        fallback_reason.as_deref(),
+    )?;
     print_px4_source(&px4_source);
     let rows = build_audit_rows(&params, &recommendations, &firmware_defaults.metadata);
 
@@ -970,6 +997,9 @@ fn build_write_plan(
             if row.status != "diff" {
                 continue;
             }
+            if row.baseline_fallback {
+                continue;
+            }
             let Ok(value) = parse_write_value(&row.baseline) else {
                 continue;
             };
@@ -1144,7 +1174,15 @@ fn print_baseline(
     device_sys_autostart: Option<i32>,
     override_sys_autostart: Option<i32>,
     px4_source: &Path,
+    fallback_reason: Option<&str>,
 ) -> Result<()> {
+    if let Some(reason) = fallback_reason {
+        println!(
+            "baseline: QGC-style firmware defaults only; airframe-specific defaults not applied ({reason})"
+        );
+        return Ok(());
+    }
+
     match (device_sys_autostart, override_sys_autostart) {
         (Some(device), Some(override_id)) if device != override_id => {
             println!(
@@ -1176,6 +1214,44 @@ fn print_baseline(
         }
     }
     Ok(())
+}
+
+fn decoded_sys_autostart(params: &HashMap<String, ParamValue>) -> Option<i32> {
+    params.get("SYS_AUTOSTART").and_then(|param| {
+        if is_integer_param_type(param.mav_type) {
+            decode_integer_value(param.value, param.mav_type, param.encoding)
+                .and_then(|value| i32::try_from(value).ok())
+        } else {
+            let value = param.value.round();
+            (param.value.is_finite() && (param.value - value).abs() <= 0.0001)
+                .then_some(value as i32)
+        }
+    })
+}
+
+fn baseline_fallback_reason(
+    baseline_sys_autostart: Option<i32>,
+    airframe_defaults: &HashMap<String, String>,
+    wanted_params: &HashSet<String>,
+) -> Option<String> {
+    match baseline_sys_autostart {
+        None => Some("device SYS_AUTOSTART was not received".into()),
+        Some(0) => Some("SYS_AUTOSTART=0 does not select an airframe".into()),
+        Some(id) => {
+            if airframe_defaults.is_empty() {
+                Some(format!("PX4 airframe {id} was not found"))
+            } else if !airframe_defaults
+                .keys()
+                .any(|name| name != "SYS_AUTOSTART" && wanted_params.contains(name))
+            {
+                Some(format!(
+                    "PX4 airframe {id} has no matching parameter defaults"
+                ))
+            } else {
+                None
+            }
+        }
+    }
 }
 
 fn airframe_name(px4_source: &Path, sys_autostart: i32) -> Result<Option<String>> {
@@ -1507,8 +1583,15 @@ fn build_recommendations(
     airframe: HashMap<String, String>,
     serial_config_params: &HashSet<String>,
     serial_port_indexes: &HashMap<String, String>,
+    fallback_reason: Option<&str>,
 ) -> HashMap<String, Recommendation> {
     let mut out = HashMap::new();
+    let fallback = fallback_reason.is_some();
+    let firmware_source = if fallback {
+        "QGC-style firmware default"
+    } else {
+        "firmware default"
+    };
     for (name, value) in firmware {
         let (value, label) =
             normalize_default_value(&name, value, serial_config_params, serial_port_indexes);
@@ -1516,7 +1599,8 @@ fn build_recommendations(
             name,
             Recommendation {
                 value,
-                source: recommendation_source("firmware default", label.as_deref()),
+                source: recommendation_source(firmware_source, label.as_deref()),
+                fallback,
             },
         );
     }
@@ -1528,6 +1612,7 @@ fn build_recommendations(
             Recommendation {
                 value,
                 source: recommendation_source("airframe default", label.as_deref()),
+                fallback: false,
             },
         );
     }
@@ -1719,6 +1804,7 @@ fn build_audit_rows(
             let source = rec
                 .map(|r| r.source.clone())
                 .unwrap_or_else(|| "not found".into());
+            let baseline_fallback = rec.map(|r| r.fallback).unwrap_or(false);
             let status = classify_status(&current, &baseline);
             AuditRow {
                 name: name.clone(),
@@ -1726,6 +1812,7 @@ fn build_audit_rows(
                 baseline,
                 source,
                 status,
+                baseline_fallback,
                 mav_type: value.mav_type,
                 encoding: value.encoding,
                 metadata: metadata.get(name).cloned(),
@@ -1741,9 +1828,9 @@ fn print_audit_table(rows: &[AuditRow]) {
     table.set_header(vec!["Param", "Device", "PX4 baseline", "Source", "Status"]);
 
     for row in rows {
-        let color = match row.status.as_str() {
+        let color = match display_status(row).as_str() {
             "match" => Color::Green,
-            "diff" => Color::Red,
+            "diff" | "fallback match" | "fallback diff" => Color::Red,
             "unknown" => Color::DarkGrey,
             _ => Color::White,
         };
@@ -1752,7 +1839,7 @@ fn print_audit_table(rows: &[AuditRow]) {
             Cell::new(&row.current),
             Cell::new(&row.baseline),
             Cell::new(&row.source),
-            Cell::new(&row.status).fg(color),
+            Cell::new(display_status(row)).fg(color),
         ]);
     }
 
@@ -1917,6 +2004,12 @@ impl TuiApp {
             return None;
         }
 
+        if row.baseline_fallback {
+            self.status_message =
+                format!("Refusing to write fallback QGC-style baseline for {name}");
+            return None;
+        }
+
         match parse_write_value(&baseline) {
             Ok(value) => Some(WriteRequest {
                 name,
@@ -1936,6 +2029,7 @@ impl TuiApp {
         self.rows
             .iter()
             .filter(|row| row.status == "diff")
+            .filter(|row| !row.baseline_fallback)
             .filter_map(|row| {
                 let value = parse_write_value(&row.baseline).ok()?;
                 Some(WriteRequest {
@@ -2291,8 +2385,8 @@ fn draw_tui(frame: &mut ratatui::Frame, app: &TuiApp) {
             TuiCell::from(row.name.clone()),
             TuiCell::from(row.current.clone()),
             TuiCell::from(row.baseline.clone()),
-            TuiCell::from(row.source.clone()),
-            TuiCell::from(row.status.clone()).style(status_style(&row.status)),
+            TuiCell::from(row.source.clone()).style(source_style(row)),
+            TuiCell::from(display_status(row)).style(status_style_for_row(row)),
         ]))
     });
 
@@ -2461,7 +2555,7 @@ fn selected_detail_lines(row: &AuditRow, status_message: &str) -> Vec<Line<'stat
         Span::styled("Selected: ", Style::default().bold()),
         Span::raw(row.name.clone()),
         Span::raw("  "),
-        Span::styled(row.status.clone(), status_style(&row.status)),
+        Span::styled(display_status(row), status_style_for_row(row)),
     ])];
 
     if let Some(metadata) = &row.metadata {
@@ -2480,6 +2574,13 @@ fn selected_detail_lines(row: &AuditRow, status_message: &str) -> Vec<Line<'stat
                 compact_line(description, 150)
             )));
         }
+    }
+
+    if row.baseline_fallback {
+        lines.push(Line::from(vec![Span::styled(
+            "Fallback baseline: firmware metadata/default only; airframe-specific defaults were not applied and default writes are disabled for this row.",
+            Style::default().red().bold(),
+        )]));
     }
 
     lines.push(Line::from(status_message.to_string()));
@@ -2597,6 +2698,30 @@ fn bit_enabled(value: i64, bit: i64) -> bool {
         return false;
     }
     (value & (1_i64 << bit)) != 0
+}
+
+fn source_style(row: &AuditRow) -> Style {
+    if row.baseline_fallback {
+        Style::default().red().bold()
+    } else {
+        Style::default()
+    }
+}
+
+fn status_style_for_row(row: &AuditRow) -> Style {
+    if row.baseline_fallback && row.status != "unknown" {
+        Style::default().red().bold()
+    } else {
+        status_style(&row.status)
+    }
+}
+
+fn display_status(row: &AuditRow) -> String {
+    if row.baseline_fallback && row.status != "unknown" {
+        format!("fallback {}", row.status)
+    } else {
+        row.status.clone()
+    }
 }
 
 fn status_style(status: &str) -> Style {
@@ -2884,6 +3009,7 @@ parameters:
             baseline: "7".into(),
             source: "firmware default".into(),
             status: "match".into(),
+            baseline_fallback: false,
             mav_type: common::MavParamType::MAV_PARAM_TYPE_INT32,
             encoding: ParamEncoding::CCast,
             metadata: Some(ParamMetadata {
@@ -3027,6 +3153,7 @@ parameters:
             Recommendation {
                 value: "2047".into(),
                 source: "firmware default".into(),
+                fallback: false,
             },
         )]);
 
@@ -3060,6 +3187,7 @@ parameters:
             Recommendation {
                 value: "2047".into(),
                 source: "firmware default".into(),
+                fallback: false,
             },
         )]);
 
@@ -3082,6 +3210,91 @@ parameters:
         assert!(err.to_string().contains("must be whole"));
     }
 
+    #[test]
+    fn decodes_sys_autostart_after_bytewise_encoding_inference() {
+        let mut params = HashMap::from([(
+            "SYS_AUTOSTART".into(),
+            ParamValue {
+                value: f32::from_bits(4019),
+                mav_type: common::MavParamType::MAV_PARAM_TYPE_INT32,
+                encoding: ParamEncoding::CCast,
+            },
+        )]);
+        let metadata = HashMap::from([(
+            "SYS_AUTOSTART".into(),
+            ParamMetadata {
+                min: Some("0".into()),
+                max: Some("999999".into()),
+                ..ParamMetadata::default()
+            },
+        )]);
+        let recommendations = HashMap::from([(
+            "SYS_AUTOSTART".into(),
+            Recommendation {
+                value: "4019".into(),
+                source: "airframe default".into(),
+                fallback: false,
+            },
+        )]);
+
+        infer_param_encodings(&mut params, &metadata, &recommendations, None);
+
+        assert_eq!(
+            params.get("SYS_AUTOSTART").expect("param").encoding,
+            ParamEncoding::Bytewise
+        );
+        assert_eq!(decoded_sys_autostart(&params), Some(4019));
+    }
+
+    #[test]
+    fn marks_qgc_style_fallback_recommendations() {
+        let recommendations = build_recommendations(
+            HashMap::from([("EKF2_GPS_CTRL".into(), "7".into())]),
+            HashMap::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            Some("SYS_AUTOSTART=0 does not select an airframe"),
+        );
+
+        let rec = recommendations
+            .get("EKF2_GPS_CTRL")
+            .expect("recommendation");
+        assert_eq!(rec.source, "QGC-style firmware default");
+        assert!(rec.fallback);
+    }
+
+    #[test]
+    fn skips_fallback_baselines_for_default_writes() {
+        let row = AuditRow {
+            baseline_fallback: true,
+            ..test_row("EKF2_GPS_CTRL", "diff")
+        };
+        let writes = build_write_plan(
+            &Args {
+                connect: None,
+                px4_source: None,
+                sys_autostart: None,
+                param_timeout: 15,
+                verbose: false,
+                plain: false,
+                set_params: Vec::new(),
+                write_diffs: true,
+                yes: false,
+                write_timeout: 3,
+                list_ports: false,
+            },
+            &HashMap::new(),
+            &[row],
+        )
+        .expect_err("fallback baseline should not be writable");
+
+        assert!(
+            writes
+                .to_string()
+                .contains("no writable parameters selected")
+        );
+    }
+
     fn test_row(name: &str, status: &str) -> AuditRow {
         AuditRow {
             name: name.into(),
@@ -3089,6 +3302,7 @@ parameters:
             baseline: "0".into(),
             source: "firmware default".into(),
             status: status.into(),
+            baseline_fallback: false,
             mav_type: common::MavParamType::MAV_PARAM_TYPE_INT32,
             encoding: ParamEncoding::CCast,
             metadata: None,

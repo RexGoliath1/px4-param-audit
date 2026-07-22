@@ -349,6 +349,12 @@ If `--sys-autostart` is supplied, that airframe ID is used for the comparison
 baseline instead of the device's reported `SYS_AUTOSTART`. Supplying a baseline
 only changes comparison output; it does not write by itself.
 
+If the airframe cannot be selected or does not match any reported parameters,
+the tool falls back to QGC-style firmware defaults only. Fallback rows are shown
+as `fallback match` or `fallback diff` and are highlighted as warnings because
+airframe-specific defaults were not applied. Fallback baselines are display-only
+for default reset actions.
+
 The selected PX4 checkout path and git commit are printed at startup. Treat
 diffs as authoritative only when the baseline source matches the PX4 version you
 intend to compare against.
