@@ -58,10 +58,7 @@ fn write_output_text(text: &str) {
 }
 
 #[derive(Parser, Debug)]
-#[command(
-    version,
-    about = "PX4 parameter audit and explicit write tool for multirotors"
-)]
+#[command(version, about = "PX4 parameter audit tool for multirotors")]
 struct Args {
     /// MAVLink connection string. Supports serial, udp-listen, udp-connect/udp, and tcp.
     #[arg(short, long)]
@@ -98,10 +95,6 @@ struct Args {
     /// Print a static table instead of opening the interactive TUI.
     #[arg(long)]
     plain: bool,
-
-    /// Set one parameter to a numeric value, for example SYS_HAS_GPS=1. May be repeated.
-    #[arg(long = "set", value_name = "PARAM=VALUE")]
-    set_params: Vec<String>,
 
     /// Write every numeric diff with a known PX4 baseline value.
     #[arg(long)]
@@ -182,7 +175,6 @@ struct AuditRow {
     status: String,
     baseline_fallback: bool,
     mav_type: common::MavParamType,
-    encoding: ParamEncoding,
     metadata: Option<ParamMetadata>,
 }
 
@@ -340,10 +332,15 @@ fn main() -> Result<()> {
     ];
     tui_context_lines.extend(voxl_lines);
     tui_context_lines.push(px4_source_line);
-    let rows = build_audit_rows(&params, &recommendations, &firmware_defaults.metadata);
+    let rows = build_audit_rows(
+        &params,
+        &recommendations,
+        &firmware_defaults.metadata,
+        integer_encoding,
+    );
 
-    if args.write_diffs || !args.set_params.is_empty() {
-        let writes = build_write_plan(&args, &params, &rows)?;
+    if args.write_diffs {
+        let writes = build_write_plan(&args, &rows, integer_encoding)?;
         confirm_writes(&writes, args.yes)?;
         apply_writes(
             &mut *conn,
@@ -367,6 +364,7 @@ fn main() -> Result<()> {
             &identity,
             rows,
             tui_context_lines,
+            integer_encoding,
             Duration::from_secs(args.write_timeout),
         )?;
     }
@@ -1500,8 +1498,8 @@ fn request_param_by_index(
 
 fn build_write_plan(
     args: &Args,
-    params: &HashMap<String, ParamValue>,
     rows: &[AuditRow],
+    write_encoding: ParamEncoding,
 ) -> Result<Vec<WriteRequest>> {
     let mut writes: HashMap<String, WriteRequest> = HashMap::new();
 
@@ -1522,28 +1520,11 @@ fn build_write_plan(
                     name: row.name.clone(),
                     value,
                     mav_type: row.mav_type,
-                    encoding: row.encoding,
+                    encoding: write_encoding_for_type(row.mav_type, write_encoding),
                     source: format!("PX4 baseline ({})", row.source),
                 },
             );
         }
-    }
-
-    for spec in &args.set_params {
-        let (name, value) = parse_set_spec(spec)?;
-        let current = params.get(&name).with_context(|| {
-            format!("cannot set unknown parameter {name}; it was not reported by PX4")
-        })?;
-        writes.insert(
-            name.clone(),
-            WriteRequest {
-                name,
-                value,
-                mav_type: current.mav_type,
-                encoding: current.encoding,
-                source: "--set".into(),
-            },
-        );
     }
 
     let mut writes: Vec<_> = writes.into_values().collect();
@@ -1553,19 +1534,6 @@ fn build_write_plan(
         "no writable parameters selected; known diffs may have nonnumeric baselines"
     );
     Ok(writes)
-}
-
-fn parse_set_spec(spec: &str) -> Result<(String, f32)> {
-    let Some((name, value)) = spec.split_once('=') else {
-        bail!("--set must look like PARAM=VALUE");
-    };
-    let name = name.trim();
-    ensure!(!name.is_empty(), "--set parameter name cannot be empty");
-    ensure!(
-        name.len() <= 16,
-        "MAVLink parameter names are at most 16 bytes: {name}"
-    );
-    Ok((name.to_string(), parse_write_value(value.trim())?))
 }
 
 fn parse_write_value(value: &str) -> Result<f32> {
@@ -1616,7 +1584,7 @@ fn apply_writes(
 ) -> Result<()> {
     for write in writes {
         send_param_set(conn, identity, &write)?;
-        let confirmed = wait_for_param_confirmation(conn, &write.name, timeout, write.encoding)
+        let confirmed = wait_for_param_confirmation(conn, &write, timeout)
             .with_context(|| format!("PX4 did not confirm {}", write.name))?;
         statusln!("set {} = {}", write.name, format_param(&confirmed));
     }
@@ -1643,21 +1611,23 @@ fn send_param_set(
 
 fn wait_for_param_confirmation(
     conn: &mut dyn MavTransport,
-    name: &str,
+    write: &WriteRequest,
     timeout: Duration,
-    encoding: ParamEncoding,
 ) -> Result<ParamValue> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         match conn.recv() {
             Some((_, common::MavMessage::PARAM_VALUE(param))) => {
                 let param_name = param.param_id.to_str().unwrap_or("");
-                if param_name == name {
-                    return Ok(ParamValue {
+                if param_name == write.name {
+                    let confirmed = ParamValue {
                         value: param.param_value,
                         mav_type: param.param_type,
-                        encoding,
-                    });
+                        encoding: write.encoding,
+                    };
+                    if write_confirmation_matches(write, &confirmed) {
+                        return Ok(confirmed);
+                    }
                 }
             }
             Some(_) => {}
@@ -1665,6 +1635,20 @@ fn wait_for_param_confirmation(
         }
     }
     bail!("timed out waiting for PARAM_VALUE");
+}
+
+fn write_confirmation_matches(write: &WriteRequest, confirmed: &ParamValue) -> bool {
+    let confirmed = ParamValue {
+        value: confirmed.value,
+        mav_type: write.mav_type,
+        encoding: write.encoding,
+    };
+    let expected = ParamValue {
+        value: write.value,
+        mav_type: write.mav_type,
+        encoding: ParamEncoding::CCast,
+    };
+    values_equivalent(&format_param(&confirmed), &format_param(&expected))
 }
 
 fn print_identity(identity: &VehicleIdentity) {
@@ -2492,17 +2476,12 @@ fn infer_param_encodings(
 ) -> ParamEncoding {
     let global = preferred
         .unwrap_or_else(|| infer_global_integer_encoding(params, metadata, recommendations));
-    for (name, param) in params {
+    for param in params.values_mut() {
         if !is_integer_param_type(param.mav_type) {
             param.encoding = ParamEncoding::CCast;
             continue;
         }
-        param.encoding = infer_integer_param_encoding(
-            param,
-            metadata.get(name),
-            recommendations.get(name),
-            global,
-        );
+        param.encoding = global;
     }
     global
 }
@@ -2550,22 +2529,6 @@ fn infer_global_integer_encoding(
         ParamEncoding::Bytewise
     } else {
         ParamEncoding::CCast
-    }
-}
-
-fn infer_integer_param_encoding(
-    param: &ParamValue,
-    metadata: Option<&ParamMetadata>,
-    recommendation: Option<&Recommendation>,
-    fallback: ParamEncoding,
-) -> ParamEncoding {
-    let (byte_score, cast_score) = encoding_scores(param, metadata, recommendation);
-    if byte_score >= cast_score + 3 {
-        ParamEncoding::Bytewise
-    } else if cast_score >= byte_score + 3 {
-        ParamEncoding::CCast
-    } else {
-        fallback
     }
 }
 
@@ -2633,11 +2596,24 @@ fn build_audit_rows(
     params: &HashMap<String, ParamValue>,
     recommendations: &HashMap<String, Recommendation>,
     metadata: &HashMap<String, ParamMetadata>,
+    integer_encoding: ParamEncoding,
 ) -> Vec<AuditRow> {
     let mut rows: Vec<AuditRow> = params
         .iter()
         .map(|(name, value)| {
-            let current = format_param(value);
+            let metadata = metadata.get(name).cloned();
+            let mav_type = effective_mav_type(value.mav_type, metadata.as_ref());
+            let encoding =
+                if is_integer_param_type(mav_type) && !is_integer_param_type(value.mav_type) {
+                    integer_encoding
+                } else {
+                    value.encoding
+                };
+            let current = format_param(&ParamValue {
+                value: value.value,
+                mav_type,
+                encoding,
+            });
             let rec = recommendations.get(name);
             let baseline = rec
                 .map(|r| r.value.clone())
@@ -2654,9 +2630,8 @@ fn build_audit_rows(
                 source,
                 status,
                 baseline_fallback,
-                mav_type: value.mav_type,
-                encoding: value.encoding,
-                metadata: metadata.get(name).cloned(),
+                mav_type,
+                metadata,
             }
         })
         .collect();
@@ -2691,6 +2666,7 @@ struct TuiApp {
     rows: Vec<AuditRow>,
     filtered: Vec<usize>,
     context_lines: Vec<String>,
+    write_encoding: ParamEncoding,
     query: String,
     edit_value: String,
     pending_writes: Vec<WriteRequest>,
@@ -2717,12 +2693,13 @@ enum TuiAction {
 }
 
 impl TuiApp {
-    fn new(rows: Vec<AuditRow>, context_lines: Vec<String>) -> Self {
+    fn new(rows: Vec<AuditRow>, context_lines: Vec<String>, write_encoding: ParamEncoding) -> Self {
         let filtered = (0..rows.len()).collect();
         Self {
             rows,
             filtered,
             context_lines,
+            write_encoding,
             query: String::new(),
             edit_value: String::new(),
             pending_writes: Vec::new(),
@@ -2813,9 +2790,16 @@ impl TuiApp {
     }
 
     fn update_selected_value(&mut self, confirmed: ParamValue) {
+        let write_encoding = self.write_encoding;
         if let Some(row) = self.selected_row_mut() {
-            row.current = format_param(&confirmed);
-            row.mav_type = confirmed.mav_type;
+            let mav_type = effective_mav_type(confirmed.mav_type, row.metadata.as_ref());
+            let encoding = write_encoding_for_type(mav_type, write_encoding);
+            row.current = format_param(&ParamValue {
+                value: confirmed.value,
+                mav_type,
+                encoding,
+            });
+            row.mav_type = mav_type;
             row.status = classify_status(&row.current, &row.baseline);
             self.status_message = format!("Set {} = {}", row.name, row.current);
         }
@@ -2823,9 +2807,16 @@ impl TuiApp {
     }
 
     fn update_value_by_name(&mut self, name: &str, confirmed: ParamValue) {
+        let write_encoding = self.write_encoding;
         if let Some(row) = self.rows.iter_mut().find(|row| row.name == name) {
-            row.current = format_param(&confirmed);
-            row.mav_type = confirmed.mav_type;
+            let mav_type = effective_mav_type(confirmed.mav_type, row.metadata.as_ref());
+            let encoding = write_encoding_for_type(mav_type, write_encoding);
+            row.current = format_param(&ParamValue {
+                value: confirmed.value,
+                mav_type,
+                encoding,
+            });
+            row.mav_type = mav_type;
             row.status = classify_status(&row.current, &row.baseline);
         }
         self.apply_filter();
@@ -2838,7 +2829,7 @@ impl TuiApp {
         let name = row.name.clone();
         let baseline = row.baseline.clone();
         let mav_type = row.mav_type;
-        let encoding = row.encoding;
+        let encoding = write_encoding_for_type(row.mav_type, self.write_encoding);
         let source = row.source.clone();
         let current = row.current.clone();
 
@@ -2879,7 +2870,7 @@ impl TuiApp {
                     name: row.name.clone(),
                     value,
                     mav_type: row.mav_type,
-                    encoding: row.encoding,
+                    encoding: write_encoding_for_type(row.mav_type, self.write_encoding),
                     source: format!("TUI default all ({})", row.source),
                 })
             })
@@ -2915,6 +2906,7 @@ fn run_tui(
     identity: &VehicleIdentity,
     rows: Vec<AuditRow>,
     context_lines: Vec<String>,
+    write_encoding: ParamEncoding,
     write_timeout: Duration,
 ) -> Result<()> {
     let _guard = TuiTerminalGuard::enter()?;
@@ -2924,7 +2916,7 @@ fn run_tui(
         &mut terminal,
         conn,
         identity,
-        TuiApp::new(rows, context_lines),
+        TuiApp::new(rows, context_lines, write_encoding),
         write_timeout,
     );
     terminal.show_cursor()?;
@@ -2977,7 +2969,7 @@ fn run_tui_loop(
                 app.status_message = format!("Writing {} = {}...", write.name, write.value);
                 terminal.draw(|frame| draw_tui(frame, &app))?;
                 match send_param_set(conn, identity, &write).and_then(|_| {
-                    wait_for_param_confirmation(conn, &write.name, write_timeout, write.encoding)
+                    wait_for_param_confirmation(conn, &write, write_timeout)
                         .with_context(|| format!("PX4 did not confirm {}", write.name))
                 }) {
                     Ok(confirmed) => {
@@ -3006,13 +2998,8 @@ fn run_tui_loop(
                     );
                     terminal.draw(|frame| draw_tui(frame, &app))?;
                     match send_param_set(conn, identity, &write).and_then(|_| {
-                        wait_for_param_confirmation(
-                            conn,
-                            &write.name,
-                            write_timeout,
-                            write.encoding,
-                        )
-                        .with_context(|| format!("PX4 did not confirm {}", write.name))
+                        wait_for_param_confirmation(conn, &write, write_timeout)
+                            .with_context(|| format!("PX4 did not confirm {}", write.name))
                     }) {
                         Ok(confirmed) => {
                             written += 1;
@@ -3107,7 +3094,7 @@ fn handle_key(app: &mut TuiApp, key: KeyEvent) -> TuiAction {
                             name: row.name.clone(),
                             value,
                             mav_type: row.mav_type,
-                            encoding: row.encoding,
+                            encoding: write_encoding_for_type(row.mav_type, app.write_encoding),
                             source: "TUI edit".into(),
                         });
                     }
@@ -3690,6 +3677,50 @@ fn encode_param_set_value(
     }
 }
 
+fn write_encoding_for_type(
+    mav_type: common::MavParamType,
+    integer_encoding: ParamEncoding,
+) -> ParamEncoding {
+    if is_integer_param_type(mav_type) {
+        integer_encoding
+    } else {
+        ParamEncoding::CCast
+    }
+}
+
+fn effective_mav_type(
+    reported: common::MavParamType,
+    metadata: Option<&ParamMetadata>,
+) -> common::MavParamType {
+    metadata
+        .and_then(metadata_mav_type)
+        .filter(|metadata_type| {
+            *metadata_type != common::MavParamType::MAV_PARAM_TYPE_REAL32
+                || reported == common::MavParamType::MAV_PARAM_TYPE_REAL32
+        })
+        .unwrap_or(reported)
+}
+
+fn metadata_mav_type(metadata: &ParamMetadata) -> Option<common::MavParamType> {
+    let raw = metadata.param_type.as_deref()?.to_ascii_lowercase();
+    let normalized = raw
+        .trim()
+        .trim_start_matches("param_type_")
+        .trim_start_matches("mav_param_type_");
+    match normalized {
+        "uint8" => Some(common::MavParamType::MAV_PARAM_TYPE_UINT8),
+        "int8" => Some(common::MavParamType::MAV_PARAM_TYPE_INT8),
+        "uint16" => Some(common::MavParamType::MAV_PARAM_TYPE_UINT16),
+        "int16" => Some(common::MavParamType::MAV_PARAM_TYPE_INT16),
+        "uint32" => Some(common::MavParamType::MAV_PARAM_TYPE_UINT32),
+        "int32" | "enum" | "bitmask" | "boolean" | "bool" => {
+            Some(common::MavParamType::MAV_PARAM_TYPE_INT32)
+        }
+        "float" | "real32" => Some(common::MavParamType::MAV_PARAM_TYPE_REAL32),
+        _ => None,
+    }
+}
+
 fn checked_integer_for_type(value: f32, mav_type: common::MavParamType) -> Result<i64> {
     match mav_type {
         common::MavParamType::MAV_PARAM_TYPE_UINT8 => checked_integer(value, 0, u8::MAX as i64),
@@ -3905,7 +3936,6 @@ parameters:
             status: "match".into(),
             baseline_fallback: false,
             mav_type: common::MavParamType::MAV_PARAM_TYPE_INT32,
-            encoding: ParamEncoding::CCast,
             metadata: Some(ParamMetadata {
                 param_type: Some("bitmask".into()),
                 bits: vec![
@@ -3951,6 +3981,7 @@ parameters:
                 test_row("GPS_1_CONFIG", "diff"),
             ],
             vec!["Baseline: test".into()],
+            ParamEncoding::Bytewise,
         );
 
         assert_eq!(app.filtered.len(), 3);
@@ -4178,14 +4209,13 @@ parameters:
                 param_timeout: 15,
                 verbose: false,
                 plain: false,
-                set_params: Vec::new(),
                 write_diffs: true,
                 yes: false,
                 write_timeout: 3,
                 list_ports: false,
             },
-            &HashMap::new(),
             &[row],
+            ParamEncoding::Bytewise,
         )
         .expect_err("fallback baseline should not be writable");
 
@@ -4194,6 +4224,104 @@ parameters:
                 .to_string()
                 .contains("no writable parameters selected")
         );
+    }
+
+    #[test]
+    fn default_writes_use_global_bytewise_encoding_for_integer_params() {
+        let mut row = test_row("EKF2_OF_CTRL", "diff");
+        row.current = "1065353216".into();
+        row.baseline = "1".into();
+        row.mav_type = common::MavParamType::MAV_PARAM_TYPE_INT32;
+
+        let writes = build_write_plan(
+            &Args {
+                connect: None,
+                px4_source: None,
+                voxl_ssh: None,
+                voxl_adb: None,
+                voxl_params_source: None,
+                sys_autostart: None,
+                param_timeout: 15,
+                verbose: false,
+                plain: false,
+                write_diffs: true,
+                yes: false,
+                write_timeout: 3,
+                list_ports: false,
+            },
+            &[row],
+            ParamEncoding::Bytewise,
+        )
+        .expect("write plan");
+
+        assert_eq!(writes[0].encoding, ParamEncoding::Bytewise);
+        assert_eq!(
+            encode_param_set_value(writes[0].value, writes[0].mav_type, writes[0].encoding)
+                .expect("encoded")
+                .to_bits(),
+            1
+        );
+    }
+
+    #[test]
+    fn px4_metadata_supplies_integer_write_type_when_mavlink_reports_float() {
+        let params = HashMap::from([(
+            "EKF2_OF_CTRL".into(),
+            ParamValue {
+                value: f32::from_bits(1),
+                mav_type: common::MavParamType::MAV_PARAM_TYPE_REAL32,
+                encoding: ParamEncoding::CCast,
+            },
+        )]);
+        let recommendations = HashMap::from([(
+            "EKF2_OF_CTRL".into(),
+            Recommendation {
+                value: "0".into(),
+                source: "firmware default".into(),
+                fallback: false,
+            },
+        )]);
+        let metadata = HashMap::from([(
+            "EKF2_OF_CTRL".into(),
+            ParamMetadata {
+                param_type: Some("int32".into()),
+                ..ParamMetadata::default()
+            },
+        )]);
+
+        let rows = build_audit_rows(
+            &params,
+            &recommendations,
+            &metadata,
+            ParamEncoding::Bytewise,
+        );
+
+        assert_eq!(rows[0].current, "1");
+        assert_eq!(rows[0].mav_type, common::MavParamType::MAV_PARAM_TYPE_INT32);
+    }
+
+    #[test]
+    fn write_confirmation_requires_matching_value() {
+        let write = WriteRequest {
+            name: "EKF2_OF_CTRL".into(),
+            value: 1.0,
+            mav_type: common::MavParamType::MAV_PARAM_TYPE_INT32,
+            encoding: ParamEncoding::Bytewise,
+            source: "test".into(),
+        };
+        let stale = ParamValue {
+            value: f32::from_bits(0),
+            mav_type: common::MavParamType::MAV_PARAM_TYPE_INT32,
+            encoding: ParamEncoding::Bytewise,
+        };
+        let confirmed = ParamValue {
+            value: f32::from_bits(1),
+            mav_type: common::MavParamType::MAV_PARAM_TYPE_INT32,
+            encoding: ParamEncoding::Bytewise,
+        };
+
+        assert!(!write_confirmation_matches(&write, &stale));
+        assert!(write_confirmation_matches(&write, &confirmed));
     }
 
     #[test]
@@ -4292,7 +4420,12 @@ parameters:
             },
         )]);
 
-        let rows = build_audit_rows(&params, &recommendations, &metadata);
+        let rows = build_audit_rows(
+            &params,
+            &recommendations,
+            &metadata,
+            ParamEncoding::Bytewise,
+        );
         let row = rows.first().expect("row");
 
         assert!(row_has_metadata_choices(row));
@@ -4356,7 +4489,6 @@ PARAM_DEFINE_INT32(EKF2_GPS_CTRL, 7);
             status: status.into(),
             baseline_fallback: false,
             mav_type: common::MavParamType::MAV_PARAM_TYPE_INT32,
-            encoding: ParamEncoding::CCast,
             metadata: None,
         }
     }

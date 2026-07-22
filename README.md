@@ -1,6 +1,6 @@
 # px4-param-audit
 
-PX4 parameter audit and explicit write tool for multirotors.
+PX4 parameter audit tool for multirotors.
 
 The first target is Pixhawk/Holybro over MAVLink serial. MAVLink UDP/TCP is
 also supported for remote links. Starling/VOXL support still needs a ModalAI
@@ -19,7 +19,7 @@ baseline provider.
   support without copying their generated defaults into this repository.
 - Opens a scrollable/searchable terminal UI listing every parameter read from
   the device.
-- Can write explicit numeric parameter values when requested.
+- Can edit/reset numeric parameter values from the TUI.
 
 Normal browse/audit mode does not write parameters. Writes only happen through
 write flags and require confirmation unless `--yes` is supplied.
@@ -35,7 +35,7 @@ Common requirements:
   `--px4-source`.
 - Access to a MAVLink endpoint: serial, UDP, or TCP.
 
-macOS:
+Computers using Homebrew:
 
 ```bash
 brew install rust git make
@@ -279,7 +279,8 @@ router/proxy.
 If `--connect` is omitted, the tool autodiscovers a PX4/Pixhawk USB serial
 port and uses baud `57600`.
 
-On macOS this commonly resolves to:
+On computers with Pixhawk USB devices exposed as `/dev/cu.*`, this commonly
+resolves to:
 
 ```text
 serial:/dev/cu.usbmodem01:57600
@@ -365,24 +366,7 @@ numeric MAVLink parameter values.
 
 After PX4 confirms the write, the device value and status update in the table.
 
-## CLI Writes
-
-Write a single numeric parameter:
-
-```bash
-./px4-param-audit \
-  --connect serial:/dev/cu.usbmodem01:57600 \
-  --set SYS_HAS_GPS=1
-```
-
-Write multiple explicit parameters:
-
-```bash
-./px4-param-audit \
-  --connect serial:/dev/cu.usbmodem01:57600 \
-  --set SYS_HAS_GPS=1 \
-  --set EKF2_GPS_CTRL=7
-```
+## CLI Default Reset
 
 Write all numeric diffs that have a known PX4 baseline:
 
@@ -398,8 +382,7 @@ you intentionally want non-interactive writes.
 
 PX4 serial-port labels such as `GPS1` are resolved to their numeric MAVLink
 parameter values when PX4's serial metadata is available. Other string-like
-defaults are not written by `--write-diffs`; use an explicit numeric
-`--set PARAM=VALUE` once the correct MAVLink parameter value is known.
+defaults are not written by `--write-diffs`.
 
 ## TUI Keys
 
